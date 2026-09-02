@@ -7,6 +7,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `web_search` and `web_fetch` requests carry a deadline (`requestTimeoutSeconds`, default 30). A provider that never answers used to hold the turn open until the user interrupted; it now fails with a plain error naming the provider and the knob.
+
 ## [2.9.0] - 2026-09-01
 
 ## [2.8.0] - 2026-08-29

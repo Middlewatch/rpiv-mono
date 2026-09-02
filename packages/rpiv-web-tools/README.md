@@ -86,6 +86,7 @@ works with no API key at all.
 | `apiKeys.<provider>` | Per-provider API key | none |
 | `baseUrls.<provider>` | Instance URL for `searxng` / `ollama` | provider default |
 | `interceptors.github` | Enables the GitHub URL interceptor | disabled |
+| `requestTimeoutSeconds` | Seconds a request may take before the tool gives up on the provider | `30` |
 | `guidance.<tool>` | Replaces the built-in tool guidance the model sees | built-in text |
 
 Environment variables win over the file: `WEB_SEARCH_PROVIDER` pins the active

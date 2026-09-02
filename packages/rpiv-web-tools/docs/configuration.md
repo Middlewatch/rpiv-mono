@@ -43,6 +43,7 @@ Failed to save Exa API key to ~/.config/rpiv-web-tools/config.json — disk writ
 | `guidance.web_fetch.promptSnippet` | string | `"Fetch and read content from a specific URL"` | One-line description the model sees for `web_fetch` |
 | `guidance.web_fetch.promptGuidelines` | string[] | 4 built-in lines | Usage rules the model sees for `web_fetch` |
 | `interceptors.github` | `boolean \| object` | absent → disabled | GitHub URL interceptor opt-in — see [github-interceptor.md](github-interceptor.md) |
+| `requestTimeoutSeconds` | number | `30` | Seconds one `web_search` or `web_fetch` request may take before the tool gives up on the provider and reports a plain error. Non-positive values fall back to the default |
 
 Every key is optional, and unknown keys round-trip untouched — the file is never
 rewritten to drop fields it does not recognise.

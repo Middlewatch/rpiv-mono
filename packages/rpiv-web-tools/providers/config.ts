@@ -64,6 +64,9 @@ export const WebToolsConfigSchema = Type.Object(
 		apiKey: Type.Optional(Type.String()),
 		guidance: Type.Optional(WebToolsGuidanceSchema),
 		interceptors: Type.Optional(InterceptorsConfigSchema),
+		// Seconds one web_search / web_fetch request may take before the tool
+		// gives up on the provider. Non-positive values fall back to the default.
+		requestTimeoutSeconds: Type.Optional(Type.Number()),
 	},
 	{ additionalProperties: true },
 );

@@ -30,7 +30,7 @@ import { createSearchProvider } from "./providers/factory.js";
 import { fetchViaGenericHtml } from "./providers/fetch-helpers.js";
 import { PROVIDERS } from "./providers/index.js";
 import { GITHUB_TOKEN_ENV_VAR, getActiveGitHubInterceptor, getInterceptors } from "./providers/interceptors/index.js";
-import type { FetchResponse, FullProvider, ProviderMeta, SearchProvider, SearchResult } from "./providers/types.js";
+import type { FullProvider, ProviderMeta, SearchProvider, SearchResult } from "./providers/types.js";
 
 // ---------------------------------------------------------------------------
 // Tunables and external surface
@@ -71,6 +71,48 @@ const LEGACY_TOP_LEVEL_KEY_PROVIDER = "brave";
 
 const loadConfig = readConfig;
 const saveConfig = writeConfig;
+
+// ---------------------------------------------------------------------------
+// Request deadline
+// ---------------------------------------------------------------------------
+
+// The host's abort signal fires on user interrupt and nothing else, so a
+// provider that never answers (a dead endpoint, a key the vendor is slow to
+// reject) would hold the turn open until someone notices. Every request
+// therefore carries its own deadline beside the host signal, and the tool
+// reports the deadline as a plain error the model can act on.
+export const DEFAULT_REQUEST_TIMEOUT_SECONDS = 30;
+
+export function resolveRequestTimeoutSeconds(config: WebToolsConfig): number {
+	const configured = config.requestTimeoutSeconds;
+	return typeof configured === "number" && Number.isFinite(configured) && configured > 0
+		? configured
+		: DEFAULT_REQUEST_TIMEOUT_SECONDS;
+}
+
+/**
+ * Run `work` with a signal that aborts on the host signal or after the
+ * configured deadline, whichever comes first. A deadline abort surfaces as a
+ * clear error naming the provider and the knob; a host abort propagates as-is.
+ */
+async function withRequestDeadline<T>(
+	config: WebToolsConfig,
+	hostSignal: AbortSignal | undefined,
+	what: string,
+	work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+	const seconds = resolveRequestTimeoutSeconds(config);
+	const deadline = AbortSignal.timeout(seconds * 1000);
+	const signal = hostSignal ? AbortSignal.any([hostSignal, deadline]) : deadline;
+	try {
+		return await work(signal);
+	} catch (err) {
+		if (deadline.aborted && !hostSignal?.aborted) {
+			throw new Error(`${what} did not answer within ${seconds}s (requestTimeoutSeconds in ${getConfigPath()})`);
+		}
+		throw err;
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Executor guidance — overrides + defaults
@@ -353,7 +395,9 @@ export function registerWebSearchTool(pi: ExtensionAPI): void {
 				details: { query: params.query, backend: providerName, resultCount: 0 },
 			});
 
-			const response = await provider.search(params.query, maxResults, signal);
+			const response = await withRequestDeadline(config, signal, `${provider.label} search`, (deadline) =>
+				provider.search(params.query, maxResults, deadline),
+			);
 
 			if (response.results.length === 0) {
 				return buildEmptyResultsEnvelope(params.query, providerName);
@@ -447,20 +491,14 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 			//      Firecrawl, Ollama) have vendor endpoints worth using.
 			//   3. Generic HTML fallback — for search-only providers (Brave, Serper,
 			//      SearXNG) or any provider that doesn't carry a `fetch` method.
-			let fetchResponse: FetchResponse | undefined;
-			for (const interceptor of getInterceptors()) {
-				const r = await interceptor.intercept(url, { raw, signal });
-				if (r) {
-					fetchResponse = r;
-					break;
+			const fetchResponse = await withRequestDeadline(config, signal, `Fetching ${url}`, async (deadline) => {
+				for (const interceptor of getInterceptors()) {
+					const r = await interceptor.intercept(url, { raw, signal: deadline });
+					if (r) return r;
 				}
-			}
-			if (!fetchResponse && "fetch" in provider) {
-				fetchResponse = await provider.fetch(url, raw, signal);
-			}
-			if (!fetchResponse) {
-				fetchResponse = await fetchViaGenericHtml(url, raw, signal);
-			}
+				if ("fetch" in provider) return provider.fetch(url, raw, deadline);
+				return fetchViaGenericHtml(url, raw, deadline);
+			});
 			const { text: bodyText, title, contentType, contentLength } = fetchResponse;
 
 			const truncation = truncateHead(bodyText, {
