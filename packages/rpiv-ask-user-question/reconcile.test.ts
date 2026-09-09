@@ -115,32 +115,34 @@ describe("reconcileAskUserQuestionTool", () => {
 	});
 });
 
-describe("registerAskUserQuestionReconciler", () => {
-	it("registers exactly one before_agent_start handler", () => {
-		const { pi, captured } = createMockPi();
-		registerAskUserQuestionReconciler(pi);
-		expect(captured.events.get("before_agent_start")).toHaveLength(1);
-	});
+for (const event of ["session_start", "before_agent_start"] as const) {
+	describe(`registerAskUserQuestionReconciler: ${event}`, () => {
+		it("registers exactly one handler", () => {
+			const { pi, captured } = createMockPi();
+			registerAskUserQuestionReconciler(pi);
+			expect(captured.events.get(event)).toHaveLength(1);
+		});
 
-	it("invoking the handler with !hasUI strips the tool", () => {
-		const { pi, captured } = createMockPi();
-		pi.setActiveTools([ASK_USER_QUESTION_TOOL_NAME, "other"]);
-		registerAskUserQuestionReconciler(pi);
-		const handler = captured.events.get("before_agent_start")![0];
-		vi.mocked(pi.setActiveTools).mockClear();
-		handler(undefined as never, createMockCtx({ hasUI: false }));
-		expect(pi.setActiveTools).toHaveBeenCalledWith(["other"]);
-	});
+		it("invoking the handler with !hasUI strips the tool", () => {
+			const { pi, captured } = createMockPi();
+			pi.setActiveTools([ASK_USER_QUESTION_TOOL_NAME, "other"]);
+			registerAskUserQuestionReconciler(pi);
+			const handler = captured.events.get(event)![0];
+			vi.mocked(pi.setActiveTools).mockClear();
+			handler(undefined as never, createMockCtx({ hasUI: false }));
+			expect(pi.setActiveTools).toHaveBeenCalledWith(["other"]);
+		});
 
-	it("invoking the handler with hasUI restores the tool", () => {
-		const { pi, captured } = createMockPi();
-		pi.setActiveTools(["other"]);
-		registerAskUserQuestionReconciler(pi);
-		const handler = captured.events.get("before_agent_start")![0];
-		handler(undefined as never, createMockCtx({ hasUI: true }));
-		expect(pi.getActiveTools()).toEqual(["other", ASK_USER_QUESTION_TOOL_NAME]);
+		it("invoking the handler with hasUI restores the tool", () => {
+			const { pi, captured } = createMockPi();
+			pi.setActiveTools(["other"]);
+			registerAskUserQuestionReconciler(pi);
+			const handler = captured.events.get(event)![0];
+			handler(undefined as never, createMockCtx({ hasUI: true }));
+			expect(pi.getActiveTools()).toEqual(["other", ASK_USER_QUESTION_TOOL_NAME]);
+		});
 	});
-});
+}
 
 describe("factory wiring (index.ts default export)", () => {
 	it("wires both registerAskUserQuestionTool and registerAskUserQuestionReconciler", async () => {
@@ -149,7 +151,8 @@ describe("factory wiring (index.ts default export)", () => {
 		// registerAskUserQuestionTool ran: tool registered + active.
 		expect(captured.tools.has(ASK_USER_QUESTION_TOOL_NAME)).toBe(true);
 		expect(captured.activeTools).toContain(ASK_USER_QUESTION_TOOL_NAME);
-		// registerAskUserQuestionReconciler ran: before_agent_start handler attached.
+		// Initial activation precedes the prompt snapshot; per-turn reconciliation remains.
+		expect(captured.events.get("session_start")).toHaveLength(1);
 		expect(captured.events.get("before_agent_start")).toHaveLength(1);
 	});
 });

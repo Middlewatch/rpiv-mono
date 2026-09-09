@@ -1,5 +1,5 @@
 /**
- * reconcile — mid-session lifecycle reconciliation for ask_user_question.
+ * Lifecycle reconciliation for ask_user_question.
  *
  * Strips or re-adds the tool to the active set so it is invisible to the LLM
  * in non-interactive runs (no UI) and present in interactive ones. Mirrors the
@@ -39,9 +39,11 @@ export function reconcileAskUserQuestionTool(pi: ExtensionAPI, ctx: ExtensionCon
 }
 
 /**
- * Attach the reconciler to `before_agent_start` so the active set is fixed up
- * before each turn's tool-list snapshot is read. Safe to call once at load.
+ * Set initial availability at session_start, before Pi snapshots prompt inputs.
+ * Keep the per-turn check for later UI changes. A prompt-rewriting extension can
+ * retain the old prompt snapshot when tools change during before_agent_start.
  */
 export function registerAskUserQuestionReconciler(pi: ExtensionAPI): void {
+	pi.on("session_start", (_event, ctx) => reconcileAskUserQuestionTool(pi, ctx));
 	pi.on("before_agent_start", (_event, ctx) => reconcileAskUserQuestionTool(pi, ctx));
 }

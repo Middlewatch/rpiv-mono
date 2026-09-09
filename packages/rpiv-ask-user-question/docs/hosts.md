@@ -19,11 +19,15 @@ The BEL is best effort: if the synchronous terminal write fails, the questionnai
 
 ### Non-interactive runs
 
-A `before_agent_start` hook reconciles the active tool set against `ctx.hasUI` before every
-turn. When there is no UI, `ask_user_question` is stripped from the list so the model never
-sees a tool it cannot use — better than offering it and auto-declining every call. When UI
-comes back, the tool is restored. The reconciler is idempotent and leaves sibling tools
-untouched.
+A `session_start` hook sets initial tool availability from `ctx.hasUI` before Pi
+snapshots the first turn's prompt inputs. Without UI, it removes `ask_user_question`;
+with UI, it restores the tool. A `before_agent_start` check handles later UI changes.
+Both hooks are idempotent and leave sibling tools untouched.
+
+The early check keeps first-request tool summaries consistent with the active tool set
+when another extension rewrites the system prompt. Pi 0.85.1 takes the prompt snapshot
+before `before_agent_start` handlers run, so a later UI change inside that hook can still
+leave a rewritten prompt's tool prose one turn behind its tool schemas.
 
 A second guard lives inside the tool handler as a one-turn backstop: if a call somehow
 arrives without UI, it returns `error: "no_ui"` and the text
