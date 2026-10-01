@@ -119,6 +119,19 @@ describe("TabBar.render", () => {
 		}
 	});
 
+	it("keeps the active tab visible when the tabs outgrow the width", () => {
+		const questions = Array.from({ length: 12 }, (_, i) => ({ header: `Header-${i + 1}`, question: "" }));
+		for (const activeTabIndex of [0, 6, 11, 12]) {
+			const tb = makeBar(buildProps({ questions, activeTabIndex }));
+			const line = tb.render(60)[0];
+			expect(visibleWidth(line)).toBeLessThanOrEqual(60);
+			expect(line).toContain(activeTabIndex === 12 ? "Submit" : `Header-${activeTabIndex + 1} `);
+			expect(line).toContain("…");
+		}
+		// Wide enough for everything: no ellipsis.
+		expect(makeBar(buildProps()).render(80)[0]).not.toContain("…");
+	});
+
 	it("setProps replaces props between renders", () => {
 		const tb = makeBar(buildProps({ activeTabIndex: 0 }));
 		const before = tb.render(80)[0];

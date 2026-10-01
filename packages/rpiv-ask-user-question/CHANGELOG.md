@@ -7,6 +7,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `ask_user_question` takes any number of questions per call. The cap of four is gone from the schema, the validator (`too_many_questions` no longer exists), and the prompt text. When the tabs outgrow the terminal width, the tab bar shows the run of tabs around the active one and marks hidden tabs with `…`.
+
 ## [2.12.0] - 2026-09-30
 
 ### Fixed

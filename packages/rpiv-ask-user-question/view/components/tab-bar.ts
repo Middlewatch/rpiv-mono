@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { StatefulView } from "../stateful-view.js";
 
 /**
@@ -31,26 +31,49 @@ export class TabBar implements StatefulView<TabBarProps> {
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		const pieces: string[] = [" ← "];
-
-		for (const tab of this.props.tabs) {
-			const box = tab.answered ? "■" : "□";
-			const rawSeg = ` ${box} ${tab.label} `;
+		// One segment per question tab, then Submit. `raw` is measured, `styled` is drawn.
+		const segs = this.props.tabs.map((tab) => {
+			const raw = ` ${tab.answered ? "■" : "□"} ${tab.label} `;
 			const styled = tab.active
-				? this.theme.bg("selectedBg", this.theme.fg("text", rawSeg))
-				: this.theme.fg(tab.answered ? "success" : "muted", rawSeg);
-			pieces.push(styled);
-			pieces.push(" ");
+				? this.theme.bg("selectedBg", this.theme.fg("text", raw))
+				: this.theme.fg(tab.answered ? "success" : "muted", raw);
+			return { raw, styled, active: tab.active };
+		});
+		const submitText = " ✓ Submit ";
+		segs.push({
+			raw: submitText,
+			styled: this.props.submit.active
+				? this.theme.bg("selectedBg", this.theme.fg("text", submitText))
+				: this.theme.fg(this.props.submit.allAnswered ? "success" : "dim", submitText),
+			active: this.props.submit.active,
+		});
+
+		// Show every tab when the row fits. Otherwise show the widest run of tabs around
+		// the active one, with "…" standing in for the tabs hidden on either side.
+		const last = segs.length - 1;
+		const rowWidth = (lo: number, hi: number): number => {
+			let w = 3 + 2 + (hi - lo); // " ← ", " →", one space between neighbors
+			for (let i = lo; i <= hi; i++) w += visibleWidth(segs[i].raw);
+			return w + (lo > 0 ? 2 : 0) + (hi < last ? 2 : 0);
+		};
+		let lo = 0;
+		let hi = last;
+		if (rowWidth(lo, hi) > width) {
+			lo = hi = Math.max(
+				0,
+				segs.findIndex((s) => s.active),
+			);
+			for (;;) {
+				if (hi < last && rowWidth(lo, hi + 1) <= width) hi++;
+				else if (lo > 0 && rowWidth(lo - 1, hi) <= width) lo--;
+				else break;
+			}
 		}
 
-		const submitText = " ✓ Submit ";
-		const submitStyled = this.props.submit.active
-			? this.theme.bg("selectedBg", this.theme.fg("text", submitText))
-			: this.theme.fg(this.props.submit.allAnswered ? "success" : "dim", submitText);
-		pieces.push(submitStyled);
-		pieces.push(" →");
-
-		const tabLine = truncateToWidth(pieces.join(""), width, "");
-		return [tabLine, ""];
+		const more = this.theme.fg("dim", "…");
+		const shown = segs.slice(lo, hi + 1).map((s) => s.styled);
+		if (lo > 0) shown.unshift(more);
+		if (hi < last) shown.push(more);
+		return [truncateToWidth(` ← ${shown.join(" ")} →`, width, ""), ""];
 	}
 }

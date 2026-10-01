@@ -1,7 +1,6 @@
 import { type Static, Type } from "typebox";
 import { LABELS_BY_KIND, ROW_INTENT_META } from "../state/row-intent.js";
 
-export const MAX_QUESTIONS = 4;
 export const MIN_OPTIONS = 2;
 export const MAX_OPTIONS = 4;
 export const MAX_HEADER_LENGTH = 16;
@@ -80,8 +79,7 @@ export const QuestionSchema = Type.Object({
 
 export const QuestionsSchema = Type.Array(QuestionSchema, {
 	minItems: 1,
-	maxItems: MAX_QUESTIONS,
-	description: "Questions to ask the user (1-4 questions)",
+	description: "Questions to ask the user. Put every pending question in one call; there is no upper limit.",
 });
 
 export const QuestionParamsSchema = Type.Object({
@@ -125,7 +123,6 @@ export type QuestionnaireError =
 	| "no_custom_ui"
 	| "no_questions"
 	| "empty_options"
-	| "too_many_questions"
 	| "duplicate_question"
 	| "duplicate_option_label"
 	| "reserved_label"

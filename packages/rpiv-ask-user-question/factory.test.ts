@@ -690,7 +690,7 @@ describe("ask_user_question — multi-question tab cycling flow", () => {
 	});
 });
 
-describe("ask_user_question — MAX_QUESTIONS (4 questions) complete flow", () => {
+describe("ask_user_question — 4 questions complete flow", () => {
 	const fourParams = {
 		questions: [
 			{

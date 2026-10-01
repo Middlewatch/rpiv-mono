@@ -5,7 +5,6 @@ import {
 	MAX_HEADER_LENGTH,
 	MAX_LABEL_LENGTH,
 	MAX_OPTIONS,
-	MAX_QUESTIONS,
 	MIN_OPTIONS,
 	type QuestionAnswer,
 	type QuestionData,
@@ -32,19 +31,13 @@ describe("QuestionsSchema — array constraints", () => {
 		expect(Value.Check(QuestionsSchema, [makeQuestion()])).toBe(true);
 	});
 
-	it("accepts MAX_QUESTIONS (4) questions", () => {
-		const four = [makeQuestion(), makeQuestion(), makeQuestion(), makeQuestion()];
-		expect(Value.Check(QuestionsSchema, four)).toBe(true);
+	it("accepts a large batch (no upper limit)", () => {
+		const twelve = Array.from({ length: 12 }, () => makeQuestion());
+		expect(Value.Check(QuestionsSchema, twelve)).toBe(true);
 	});
 
 	it("rejects empty array (minItems=1)", () => {
 		expect(Value.Check(QuestionsSchema, [])).toBe(false);
-	});
-
-	it("rejects > MAX_QUESTIONS items (maxItems=4)", () => {
-		const five = [makeQuestion(), makeQuestion(), makeQuestion(), makeQuestion(), makeQuestion()];
-		expect(Value.Check(QuestionsSchema, five)).toBe(false);
-		expect(MAX_QUESTIONS).toBe(4);
 	});
 });
 

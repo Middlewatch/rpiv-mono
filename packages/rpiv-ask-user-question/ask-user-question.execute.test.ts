@@ -1,7 +1,7 @@
 import { createMockCtx, createMockPi, mockStdout } from "@juicesharp/rpiv-test-utils";
 import { describe, expect, it, vi } from "vitest";
 import { BEL, registerAskUserQuestionTool } from "./ask-user-question.js";
-import { MAX_QUESTIONS, type QuestionnaireResult } from "./tool/types.js";
+import type { QuestionnaireResult } from "./tool/types.js";
 
 type CustomFn = (...args: unknown[]) => Promise<unknown>;
 
@@ -61,24 +61,6 @@ describe("ask_user_question.execute — early returns", () => {
 		);
 		expect(r?.details).toMatchObject({ answers: [], cancelled: true, error: "no_questions" });
 		expect(r?.content[0]).toMatchObject({ text: expect.stringContaining("At least one question") });
-	});
-
-	it("returns error: too_many_questions when questions exceed MAX_QUESTIONS", async () => {
-		const tool = register();
-		const ctx = ctxWithCustom(null);
-		const tooMany = Array.from({ length: MAX_QUESTIONS + 1 }, (_, i) => ({
-			question: `Q${i}?`,
-			options: [{ label: "A" }],
-		}));
-		const r = await tool.execute?.(
-			"tc",
-			{ questions: tooMany } as never,
-			undefined as never,
-			undefined as never,
-			ctx as never,
-		);
-		expect(r?.details).toMatchObject({ cancelled: true, error: "too_many_questions" });
-		expect(r?.content[0]).toMatchObject({ text: expect.stringContaining("At most") });
 	});
 });
 
