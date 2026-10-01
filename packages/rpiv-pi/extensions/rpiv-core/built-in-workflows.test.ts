@@ -30,6 +30,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createMockSessionChain, mockAssistantMessage } from "@juicesharp/rpiv-test-utils";
 import {
 	acts,
@@ -46,7 +47,7 @@ import {
 	type Workflow,
 } from "@juicesharp/rpiv-workflow";
 import { type RunState, runsDir, stateFilePath, takeRouteNote } from "@juicesharp/rpiv-workflow/internal";
-import { fanin, fs as fsHandle, loopSpecOf } from "@juicesharp/rpiv-workflow/registration";
+import { fanin, fs as fsHandle, loopSpecOf, type ProgressValue } from "@juicesharp/rpiv-workflow/registration";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { rpivArtifactMdOutcome } from "./artifact-collector.js";
 import {
@@ -56,6 +57,31 @@ import {
 	shipGatePasses,
 	shipVerdictOutcome,
 } from "./built-in-workflows.js";
+import {
+	codeGatePasses,
+	freshVerdicts,
+	gateRoster,
+	gateTier,
+	latestArtifactPath,
+	latestVerdictPerDimension,
+	PLAN_DIMENSIONS,
+	planGatePasses,
+	progressFromRoundCounts,
+	SLICE_DIMENSIONS,
+	sliceGatePasses,
+	unitFailedDimensions,
+	type VerdictRecord,
+	verdictBlocks,
+} from "./built-ins/gates.js";
+import {
+	CODE_PANEL_PROGRESS,
+	PLAN_PANEL_PROGRESS,
+	SHIP_PANEL_PROGRESS,
+	SLICE_PANEL_PROGRESS,
+} from "./built-ins/grade-panel.js";
+import { designOutcome, seedOnlyFindings } from "./built-ins/index.js";
+import { writeScopeVerdict } from "./built-ins/scope-checks.js";
+import { writeStructureVerdict } from "./built-ins/shared.js";
 import { deriveOutcomes } from "./outcome-derivation.js";
 import { BUNDLED_SKILLS_DIR } from "./paths.js";
 import { buildSkillContractsFromFrontmatter } from "./skill-contracts-source.js";
@@ -158,6 +184,10 @@ describe("haltWhenAllFailed wiring (flagged fanout inventory)", () => {
 			"build:slice-design",
 			"build:slice-grade",
 			"build:subplan",
+			"meta:implement",
+			"meta:implement-grade",
+			"meta:plan-grade",
+			"meta:research-grade",
 			"polish:implement",
 			"ship:grade",
 			"ship:implement",
@@ -170,6 +200,9 @@ describe("haltWhenAllFailed wiring (flagged fanout inventory)", () => {
 			"build:plan-grade",
 			"build:slice-design",
 			"build:slice-grade",
+			"meta:implement-grade",
+			"meta:plan-grade",
+			"meta:research-grade",
 			"ship:grade",
 		]);
 		// Belt-and-braces through the narrow helper: the leak-discipline stages
@@ -1480,6 +1513,11 @@ describe("SLICE_DESIGN_FANOUT (build design — deps + --upstream)", () => {
 		expect(designLoop().haltWhenAllFailed).toBe(true);
 	});
 
+	it("re-dispatches a contract-refused design unit once (retryHaltedUnits) and parses through designOutcome", () => {
+		expect(designLoop().retryHaltedUnits).toBe(1);
+		expect(findWorkflow("build").stages["slice-design"]?.outcome).toBe(designOutcome);
+	});
+
 	it("maps each slice's frontmatter deps to slice-N unit ids", async () => {
 		const rel = ".rpiv/artifacts/slices/map.md";
 		writeSlices(
@@ -1529,6 +1567,7 @@ describe("build plan gate grade panel (--context threading)", () => {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
 					research: [out(".rpiv/artifacts/research/r.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 				},
 			} as unknown as RunView,
 		});
@@ -1568,12 +1607,12 @@ describe("build plan gate grade panel (--context threading)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// build confirm panels — the second judgment on a blocking dimension runs in
-// confirm mode: the unit carries the blocking verdict as --prior so the grade
-// skill must adjudicate the prior round's findings (uphold / refute with cited
-// evidence) instead of silently out-voting them at the latest-per-dimension
-// fold. Grade panels never thread --prior; neither does a confirm unit for a
-// dimension with nothing blocking (first grade, stale verdict, carried pass).
+// build panels' --prior threading — a pending dimension (confirm or re-grade
+// of a blocking prior) threads its latest fresh verdict as --prior so the
+// grader adjudicates the prior findings instead of out-voting them; the
+// correctness arm threads its prior whenever one is fresh (its re-grades scope
+// to it). Carried passing priors on other dimensions, round 1, and stale
+// verdicts stay flagless.
 // ---------------------------------------------------------------------------
 
 describe("build confirm panels (--prior adjudication threading)", () => {
@@ -1615,6 +1654,7 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					"plan-verdicts": [
 						...OTHER_DIMS.map(passing),
 						failingCorrectness(".rpiv/artifacts/verdicts/p__correctness__round-1.json"),
@@ -1634,6 +1674,7 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					"plan-verdicts": [
 						...OTHER_DIMS.map(passing),
 						failingCorrectness(".rpiv/artifacts/verdicts/p__correctness__round-1.json"),
@@ -1653,6 +1694,7 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					goal: [out(".rpiv/artifacts/goal/goal.md")],
 					"plan-verdicts": [
 						...OTHER_DIMS.map(passing),
@@ -1672,6 +1714,7 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"code-cite-check": [out(".rpiv/artifacts/verdicts/code-cite-check__p.json")],
 					"code-verdicts": [
 						...OTHER_DIMS.map(passing),
 						failingCorrectness(".rpiv/artifacts/verdicts/p__correctness__code-round-1.json"),
@@ -1683,13 +1726,14 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 		expect(units[0]?.prompt).toContain("--prior .rpiv/artifacts/verdicts/p__correctness__code-round-1.json");
 	});
 
-	it("grade panels never thread --prior, even over the same failing verdicts", async () => {
+	it("grade panels thread --prior on round ≥ 2 (the re-grade dispatch adjudicates too)", async () => {
 		const units = await loopOf("plan-grade").units({
 			cwd: "/repo",
 			artifact: undefined,
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					"plan-verdicts": [
 						...OTHER_DIMS.map(passing),
 						failingCorrectness(".rpiv/artifacts/verdicts/p__correctness__round-1.json"),
@@ -1697,7 +1741,10 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 				},
 			} as unknown as RunView,
 		});
-		expect(units.every((u) => !u.prompt.includes("--prior"))).toBe(true);
+		// Only correctness is pending, and its fresh failing verdict threads —
+		// the re-grade grader adjudicates the prior round like a confirm does.
+		expect(units.map((u) => u.label)).toEqual(["correctness"]);
+		expect(units[0]?.prompt).toContain("--prior .rpiv/artifacts/verdicts/p__correctness__round-1.json");
 	});
 
 	it("a stale verdict (regenerated artifact) yields no --prior — nothing fresh to adjudicate", async () => {
@@ -1714,6 +1761,7 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					"plan-verdicts": [stale],
 				},
 			} as unknown as RunView,
@@ -1722,19 +1770,23 @@ describe("build confirm panels (--prior adjudication threading)", () => {
 		expect(units.every((u) => !u.prompt.includes("--prior"))).toBe(true); // ...with no prior
 	});
 
-	it("the degenerate all-passing fallback re-grades the roster without --prior (a carried pass has nothing to adjudicate)", async () => {
+	it("the degenerate all-passing fallback threads --prior on correctness only (carried passes are not re-adjudicated)", async () => {
 		const units = await loopOf("plan-confirm").units({
 			cwd: "/repo",
 			artifact: undefined,
 			state: {
 				named: {
 					plans: [out(".rpiv/artifacts/plans/p.md")],
+					"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					"plan-verdicts": [...OTHER_DIMS.map(passing), passing("correctness")],
 				},
 			} as unknown as RunView,
 		});
-		expect(units.length).toBeGreaterThan(0);
-		expect(units.every((u) => !u.prompt.includes("--prior"))).toBe(true);
+		// Nothing pending ⇒ the full roster falls back in; only correctness carries
+		// its prior (its re-grade scopes to it) — a carried pass elsewhere is not
+		// re-adjudicated.
+		expect(units.length).toBe(OTHER_DIMS.length + 1);
+		expect(units.filter((u) => u.prompt.includes("--prior")).map((u) => u.label)).toEqual(["correctness"]);
 	});
 });
 
@@ -1781,6 +1833,7 @@ describe("ship grade panel (tier-independent roster bypass)", () => {
 						plans: [dataOut(PLAN, { phase_count: 1 })],
 						research: [out(".rpiv/artifacts/research/r.md")],
 						goal: [out(".rpiv/artifacts/goal/goal.md")],
+						"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					},
 				} as unknown as RunView,
 			});
@@ -1796,6 +1849,7 @@ describe("ship grade panel (tier-independent roster bypass)", () => {
 						plans: [dataOut(PLAN, { phase_count: 1 })],
 						research: [out(".rpiv/artifacts/research/r.md")],
 						goal: [out(".rpiv/artifacts/goal/goal.md")],
+						"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					},
 				} as unknown as RunView,
 			});
@@ -1853,7 +1907,7 @@ describe("ship grade panel (tier-independent roster bypass)", () => {
 			);
 		});
 
-		it("threads --cite-check on a CLEAN floor verdict too (resolution settled); omits it only when the channel is absent", async () => {
+		it("threads --cite-check on a CLEAN floor verdict too (resolution settled); halts when the channel is absent", async () => {
 			// A clean verdict is load-bearing evidence: it settles citation
 			// RESOLUTION, so the correctness grader skips the mechanical
 			// re-resolution and spot-checks semantics only (citeCheckFlag).
@@ -1879,12 +1933,16 @@ describe("ship grade panel (tier-independent roster bypass)", () => {
 			expect(clean.filter((u) => u.label !== "correctness").every((u) => !u.prompt.includes("--cite-check"))).toBe(
 				true,
 			);
-			const absent = await SHIP_DIMENSION_FANOUT.units({
-				cwd: "/repo",
-				artifact: undefined,
-				state: { named: base } as unknown as RunView,
-			});
-			expect(absent.every((u) => !u.prompt.includes("--cite-check"))).toBe(true);
+			// Fail-closed: ship's panel is configured over the cite channel and its
+			// graph guarantees the floor ran first (shipCiteGate) — an absent verdict
+			// is an integrity break, never a flag-less dispatch.
+			expect(() =>
+				SHIP_DIMENSION_FANOUT.units({
+					cwd: "/repo",
+					artifact: undefined,
+					state: { named: base } as unknown as RunView,
+				}),
+			).toThrow(/'plan-cite-check' channel carries no fs verdict/);
 		});
 
 		it("halts the run when every dimension unit of a generation fails (haltWhenAllFailed)", () => {
@@ -2183,6 +2241,7 @@ describe("build goal channel (verbatim brief threading)", () => {
 			plans: [out(".rpiv/artifacts/plans/p.md")],
 			research: [out(".rpiv/artifacts/research/r.md")],
 			goal: [out(".rpiv/artifacts/goal/goal.md")],
+			"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 		});
 		const byLabel = new Map(units.map((u) => [u.label, u.prompt]));
 		expect(byLabel.get("completeness")).toContain("--goal .rpiv/artifacts/goal/goal.md");
@@ -2197,6 +2256,7 @@ describe("build goal channel (verbatim brief threading)", () => {
 		const bare = await gateUnits("plan-grade", {
 			plans: [out(".rpiv/artifacts/plans/p.md")],
 			research: [out(".rpiv/artifacts/research/r.md")],
+			"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 		});
 		expect(bare.every((u) => !u.prompt.includes("--goal"))).toBe(true);
 		const slice = await gateUnits("slice-grade", {
@@ -2268,6 +2328,7 @@ describe("acceptance channel (executable standard threading)", () => {
 	it("threads --acceptance into the completeness unit only (build plan gate)", async () => {
 		const units = await gateUnits("build", "plan-grade", {
 			plans: [out(".rpiv/artifacts/plans/p.md")],
+			"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 			research: [out(".rpiv/artifacts/research/r.md")],
 			goal: [out(".rpiv/artifacts/goal/goal.md")],
 			acceptance: [out(".rpiv/artifacts/acceptance/a.md")],
@@ -2282,6 +2343,7 @@ describe("acceptance channel (executable standard threading)", () => {
 	it("threads --acceptance into the completeness unit only (ship grade)", async () => {
 		const units = await gateUnits("ship", "grade", {
 			plans: [out(".rpiv/artifacts/plans/p.md")],
+			"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 			research: [out(".rpiv/artifacts/research/r.md")],
 			goal: [out(".rpiv/artifacts/goal/goal.md")],
 			acceptance: [out(".rpiv/artifacts/acceptance/a.md")],
@@ -2296,6 +2358,7 @@ describe("acceptance channel (executable standard threading)", () => {
 	it("omits --acceptance when the channel is empty (vet/polish and user workflows carry no flag)", async () => {
 		const units = await gateUnits("build", "plan-grade", {
 			plans: [out(".rpiv/artifacts/plans/p.md")],
+			"plan-cite-check": [out(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 			research: [out(".rpiv/artifacts/research/r.md")],
 			goal: [out(".rpiv/artifacts/goal/goal.md")],
 		});
@@ -2361,10 +2424,9 @@ describe("build cite-check threading (settled-facts seam)", () => {
 		expect(units.find((u) => u.label === "correctness")?.prompt).not.toContain(CITE);
 	});
 
-	it("omits --cite-check when the floor channel is absent (user workflows without the floor)", async () => {
+	it("halts when the configured floor channel is absent (fail-closed, not a flag-less dispatch)", () => {
 		const { "plan-cite-check": _cite, ...bare } = named;
-		const units = await gateUnits("plan-grade", bare);
-		expect(units.every((u) => !u.prompt.includes("--cite-check"))).toBe(true);
+		expect(() => gateUnits("plan-grade", bare)).toThrow(/'plan-cite-check' channel carries no fs verdict/);
 	});
 });
 
@@ -2563,6 +2625,53 @@ describe("build slice-check (deterministic floor)", () => {
 	};
 	const TWO_SLICES =
 		"  - { n: 1, title: A, deps: [], covers: [c1] }\n  - { n: 2, title: B, deps: [1], covers: [c2] }\n";
+	const THREE_SLICES =
+		"  - { n: 1, title: A, deps: [], covers: [c1] }\n  - { n: 2, title: B, deps: [1], covers: [c2] }\n  - { n: 3, title: C, deps: [1], covers: [c1] }\n";
+	const SHAPE3 = {
+		slices: [
+			{ n: 1, title: "A", deps: [], covers: ["c1"] },
+			{ n: 2, title: "B", deps: [1], covers: ["c2"] },
+			{ n: 3, title: "C", deps: [1], covers: ["c1"] },
+		],
+		coverage: [
+			{ id: "c1", brief: "one" },
+			{ id: "c2", brief: "two" },
+		],
+	};
+	// A map whose every slice carries a `Draws on:` line — the lift's target.
+	const seededMap = (opts: { sliceLines: string; coverage?: string; count: number; drawsOn?: string[] }) =>
+		`---\nstatus: ready\nslice_count: ${opts.count}\n${opts.coverage ?? ""}slices:\n${opts.sliceLines}---\n${Array.from({ length: opts.count }, (_, i) => `## Slice ${i + 1}: S${i + 1}\n**Draws on:** ${opts.drawsOn?.[i] ?? "src/base.ts:1"}`).join("\n")}\n`;
+	// The seed-lift stage's run function — the deterministic arm the seed-only
+	// branch of the slice-grade route dispatches (the structureRun twin).
+	const liftRun = () => {
+		const stage = findWorkflow("build").stages["slice-seed-lift"];
+		if (!stage?.run) throw new Error("build slice-seed-lift stage has no run function");
+		return stage.run as (ctx: { cwd: string; input?: undefined; state: RunView }) => {
+			artifacts: readonly { handle: { kind: string; path: string } }[];
+			data: {
+				lifted: { requires: string; slice?: number; reason?: string }[];
+				skipped: { requires: string; slice?: number; reason?: string }[];
+			};
+		};
+	};
+	// A seed-only design-readiness fail carrying arbitrary findings.
+	const seedVerdict = (findings: Record<string, unknown>[], artifact: string, ts = T_VERDICT): Output =>
+		({
+			artifacts: [],
+			kind: "json",
+			meta: { ts },
+			data: {
+				dimension: "design-readiness",
+				pass: false,
+				severity: "medium",
+				remedy: "cite",
+				artifact,
+				findings: findings.map((f) => ({ detail: "under-cited", ...f })),
+			},
+		}) as unknown as Output;
+	// A slice-seed-lift channel row (only `meta.ts` is load-bearing).
+	const liftEntry = (ts: string, data: Record<string, unknown> = {}): Output =>
+		({ artifacts: [], kind: "json", meta: { ts }, data }) as unknown as Output;
 
 	it("stamps citeDischarged when a cite-only fail's demanded seeds landed on an unchanged shape", () => {
 		mkdirSync(join(tmpDir, "src"), { recursive: true });
@@ -2678,6 +2787,322 @@ describe("build slice-check (deterministic floor)", () => {
 		}).data;
 		expect(data.pass).toBe(true);
 		expect(data.citeDischarged).toBeUndefined();
+	});
+
+	it("the discharge witness fires on the lift-channel entry alone (no post-verdict slices round)", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/seed.ts"), Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/round1.md";
+		// The post-lift map: the demanded seed landed on the judged map, in place.
+		const lifted = {
+			...write(rel, `${map({ count: 2, coverage: COV, sliceLines: TWO_SLICES })}**Draws on:** src/seed.ts:20\n`),
+			data: SHAPE,
+			meta: { ts: T_JUDGED },
+		};
+		const data = structureRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [lifted],
+					"slice-verdicts": [citeFailVerdict({ requires: "src/seed.ts:18-25" })],
+					"slice-seed-lift": [liftEntry(T_FIXED)],
+				},
+			} as unknown as RunView,
+		}).data;
+		expect(data.pass).toBe(true);
+		expect(data.citeDischarged).toBe("round1.md");
+	});
+
+	it("stamps citeDischarged beside one ADVISORY finding (the stamp floor matches the routing floor)", () => {
+		// Red today: the literal-zero withholding gate let a single ADVISORY
+		// resolver limitation — here a bare out-of-range drift cite in prose —
+		// zero the stamp and buy the re-grade anyway. The advisory floor rides
+		// through, mirroring the severity floor `allDimensionsPass` already
+		// applies to the same channel (an advisory-only verdict rates `low`).
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/seed.ts"), Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/round1.md";
+		const judged = {
+			...write(
+				rel,
+				`${map({ count: 2, coverage: COV, sliceLines: TWO_SLICES })}**Draws on:** src/seed.ts:20\nNote: the earlier anchor src/seed.ts:60 has drifted.\n`,
+			),
+			data: SHAPE,
+			meta: { ts: T_JUDGED },
+		};
+		const data = structureRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [citeFailVerdict({ requires: "src/seed.ts:18-25" })],
+					"slice-seed-lift": [liftEntry(T_FIXED)],
+				},
+			} as unknown as RunView,
+		}).data;
+		expect(data.pass).toBe(false);
+		expect(data.severity).toBe("low");
+		expect(Array.isArray(data.findings) && data.findings.length === 1).toBe(true);
+		expect(data.citeDischarged).toBe("round1.md");
+	});
+
+	it("withholds citeDischarged when a finding is blocking (a dropped coverage unit)", () => {
+		// Fail-closed arm: a BLOCKING structural finding — a coverage unit the
+		// map's own frozen first cut claims but no slice covers — still withholds
+		// the stamp; only the advisory tier rides through.
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/seed.ts"), Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/round1.md";
+		const judged = {
+			...write(rel, `${map({ count: 2, coverage: COV, sliceLines: TWO_SLICES })}**Draws on:** src/seed.ts:20\n`),
+			data: SHAPE,
+			meta: { ts: T_JUDGED },
+		};
+		// Drop c2 from every slice's covers — the frozen first cut still claims it.
+		writeFileSync(
+			join(tmpDir, rel),
+			map({
+				count: 2,
+				coverage: COV,
+				sliceLines:
+					"  - { n: 1, title: A, deps: [], covers: [c1] }\n  - { n: 2, title: B, deps: [1], covers: [c1] }\n",
+			}) + "**Draws on:** src/seed.ts:20\n",
+		);
+		const data = structureRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [citeFailVerdict({ requires: "src/seed.ts:18-25" })],
+					"slice-seed-lift": [liftEntry(T_FIXED)],
+				},
+			} as unknown as RunView,
+		}).data;
+		expect(data.pass).toBe(false);
+		expect(data.severity).toBe("high");
+		expect(data.citeDischarged).toBeUndefined();
+	});
+
+	it("a revision note's arrow pair neither flags nor withholds: the stale old half is quoted (red today)", () => {
+		// Red today: `verifyCitations` honored fences but not arrow pairs, so the
+		// note's stale old half (line 60 of a 50-line file) read as a live
+		// citation, flagged out-of-range advisory, and zeroed the stamp. Both
+		// halves of a sanctioned `old→new` pair are quotes — skipped BEFORE
+		// seen-key bookkeeping — while the live `Draws on:` occurrence of the
+		// same cite still verifies below.
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/seed.ts"), Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/round1.md";
+		const judged = {
+			...write(
+				rel,
+				`${map({ count: 2, coverage: COV, sliceLines: TWO_SLICES })}> Re-slice note: refreshed \`src/seed.ts:60→src/seed.ts:20\`.\n**Draws on:** src/seed.ts:20\n`,
+			),
+			data: SHAPE,
+			meta: { ts: T_JUDGED },
+		};
+		const data = structureRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [citeFailVerdict({ requires: "src/seed.ts:18-25" })],
+					"slice-seed-lift": [liftEntry(T_FIXED)],
+				},
+			} as unknown as RunView,
+		}).data;
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+		expect(data.citeDischarged).toBe("round1.md");
+	});
+
+	it("sliceSeedLift appends both demanded seeds to the named Draws on lines and publishes the amended map in place", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/base.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		writeFileSync(join(tmpDir, "src/alpha.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		writeFileSync(join(tmpDir, "src/beta.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/twolift.md";
+		const body = seededMap({ count: 3, coverage: COV, sliceLines: THREE_SLICES });
+		const judged = { ...write(rel, body), data: SHAPE3, meta: { ts: T_JUDGED } };
+		const out = liftRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [
+						seedVerdict(
+							[
+								{ where: "## Slice 2", requires: "src/alpha.ts:18-25" },
+								{ where: "## Slice 3", requires: "src/beta.ts:30-40" },
+							],
+							rel,
+						),
+					],
+				},
+			} as unknown as RunView,
+		});
+		expect(out.data.lifted).toEqual([
+			{ requires: "src/alpha.ts:18-25", slice: 2 },
+			{ requires: "src/beta.ts:30-40", slice: 3 },
+		]);
+		expect(out.data.skipped).toEqual([]);
+		const amended = readFileSync(join(tmpDir, rel), "utf-8");
+		expect(amended).toContain("**Draws on:** src/base.ts:1, src/alpha.ts:18-25");
+		expect(amended).toContain("**Draws on:** src/base.ts:1, src/beta.ts:30-40");
+		// every other byte identical (frontmatter + untouched slices + headings)
+		expect(amended.replace(", src/alpha.ts:18-25", "").replace(", src/beta.ts:30-40", "")).toBe(body);
+		expect(out.artifacts[0]?.handle).toEqual({ kind: "fs", path: rel });
+	});
+
+	it("does not re-append an already-satisfied seed (dedup on the evolving body)", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/alpha.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/dedup.md";
+		const body = seededMap({
+			count: 2,
+			coverage: COV,
+			sliceLines: TWO_SLICES,
+			drawsOn: ["src/alpha.ts:1", "src/alpha.ts:7"],
+		});
+		const judged = { ...write(rel, body), data: SHAPE, meta: { ts: T_JUDGED } };
+		const out = liftRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [seedVerdict([{ where: "## Slice 2", requires: "src/alpha.ts:18-25" }], rel)],
+				},
+			} as unknown as RunView,
+		});
+		expect(out.data.lifted).toEqual([]);
+		expect(out.data.skipped).toEqual([]);
+		expect(readFileSync(join(tmpDir, rel), "utf-8")).toBe(body);
+	});
+
+	it("records a seed whose where names no slice heading as skipped and leaves the map unchanged", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/alpha.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/nosliceheading.md";
+		const body = seededMap({ count: 2, coverage: COV, sliceLines: TWO_SLICES });
+		const judged = { ...write(rel, body), data: SHAPE, meta: { ts: T_JUDGED } };
+		const out = liftRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [
+						seedVerdict([{ where: "prose: the footing is thin", requires: "src/alpha.ts:18-25" }], rel),
+					],
+				},
+			} as unknown as RunView,
+		});
+		expect(out.data.skipped).toEqual([{ requires: "src/alpha.ts:18-25", reason: "no-slice-heading" }]);
+		expect(out.data.lifted).toEqual([]);
+		expect(readFileSync(join(tmpDir, rel), "utf-8")).toBe(body);
+	});
+
+	it("records no-draws-on-line when the named section carries no Draws on line", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src/base.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		writeFileSync(join(tmpDir, "src/alpha.ts"), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		const rel = ".rpiv/artifacts/slices/nodrawson.md";
+		const body =
+			"---\nstatus: ready\nslice_count: 2\n" +
+			COV +
+			"slices:\n" +
+			TWO_SLICES +
+			"---\n## Slice 1: S1\n**Draws on:** src/base.ts:1\n## Slice 2: S2\n**Scope:** only a scope line\n";
+		const judged = { ...write(rel, body), data: SHAPE, meta: { ts: T_JUDGED } };
+		const out = liftRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [seedVerdict([{ where: "## Slice 2", requires: "src/alpha.ts:18-25" }], rel)],
+				},
+			} as unknown as RunView,
+		});
+		expect(out.data.skipped).toEqual([{ requires: "src/alpha.ts:18-25", slice: 2, reason: "no-draws-on-line" }]);
+		expect(readFileSync(join(tmpDir, rel), "utf-8")).toBe(body);
+	});
+
+	it("halts loudly when the latest verdict is not seed-only (misroute guard)", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		const rel = ".rpiv/artifacts/slices/misroute.md";
+		const judged = {
+			...write(rel, map({ count: 2, coverage: COV, sliceLines: TWO_SLICES })),
+			data: SHAPE,
+			meta: { ts: T_JUDGED },
+		};
+		const structural = seedVerdict([{ where: "## Slice 1", detail: "bundles two decisions" }], rel);
+		(structural.data as { remedy?: string }).remedy = undefined;
+		expect(() =>
+			liftRun()({
+				cwd: tmpDir,
+				input: undefined,
+				state: { named: { slices: [judged], "slice-verdicts": [structural] } } as unknown as RunView,
+			}),
+		).toThrow(/is not a seed-only cite fail/);
+	});
+
+	it("the f9a6 end-to-end shape: lift → slice-check stamp → slice-design (no fix session, no re-grade)", () => {
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		for (const f of ["base", "alpha", "beta"]) {
+			writeFileSync(join(tmpDir, `src/${f}.ts`), Array.from({ length: 50 }, (_, i) => `l${i}`).join("\n"));
+		}
+		const rel = ".rpiv/artifacts/slices/round1.md";
+		const body = seededMap({ count: 3, coverage: COV, sliceLines: THREE_SLICES });
+		const judged = { ...write(rel, body), data: SHAPE3, meta: { ts: T_JUDGED } };
+		const verdict = seedVerdict(
+			[
+				{ where: "## Slice 2", requires: "src/alpha.ts:18-25" },
+				{ where: "## Slice 3", requires: "src/beta.ts:30-40" },
+			],
+			rel,
+		);
+		const liftOut = liftRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: { named: { slices: [judged], "slice-verdicts": [verdict] } } as unknown as RunView,
+		});
+		expect(liftOut.data.lifted).toHaveLength(2);
+		const checkData = structureRun()({
+			cwd: tmpDir,
+			input: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-verdicts": [verdict],
+					"slice-seed-lift": [liftEntry(T_FIXED)],
+				},
+			} as unknown as RunView,
+		}).data;
+		expect(checkData.pass).toBe(true);
+		expect(checkData.citeDischarged).toBe("round1.md");
+		// The gate folds green on the stamp: the slice-check edge routes straight
+		// to design — the fix arm and the grade panel are both skipped.
+		const edge = findWorkflow("build").edges["slice-check"];
+		if (typeof edge !== "function") throw new Error("build slice-check edge is not a function");
+		const next = (edge as EdgeFn)({
+			output: undefined,
+			state: {
+				named: {
+					slices: [judged],
+					"slice-check": [{ artifacts: [], kind: "json", meta: {}, data: checkData } as unknown as Output],
+					"slice-verdicts": [verdict],
+					"slice-seed-lift": [liftEntry(T_FIXED)],
+				},
+			} as unknown as RunView,
+		});
+		expect(next).toBe("slice-design");
 	});
 
 	// Fence-aware citation floor — a `path:line` shape inside a fenced code block is
@@ -3042,6 +3467,52 @@ describe("build slice-check (deterministic floor)", () => {
 		const sliceFix = findWorkflow("build").stages["slice-fix"];
 		expect(sliceFix?.reads).toContainEqual(fanin("slice-check"));
 	});
+
+	it("slice-seed-lift reads slices + the slice-verdicts fanin and re-enters slice-check via a plain edge", () => {
+		const lift = findWorkflow("build").stages["slice-seed-lift"];
+		expect(lift?.reads).toEqual(["slices", fanin("slice-verdicts")]);
+		expect(findWorkflow("build").edges["slice-seed-lift"]).toBe("slice-check");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Design-readiness corpus replay — the committed census of design-readiness
+// fail shapes, extracted once from the gitignored run trails (see the
+// fixture's _meta for the population/derivation rules). Pins the census
+// counts and the fail-closed direction of the seed-only classification.
+// ---------------------------------------------------------------------------
+describe("design-readiness corpus replay (trail-derived shapes)", () => {
+	type CorpusRow = {
+		class: string;
+		pass: boolean;
+		remedy?: string;
+		findings: { requires?: string }[];
+	};
+	const corpus = JSON.parse(
+		readFileSync(
+			fileURLToPath(new URL("./built-ins/__fixtures__/design-readiness-corpus.json", import.meta.url)),
+			"utf-8",
+		),
+	) as { _meta: Record<string, unknown>; rows: CorpusRow[] };
+
+	it("carries the ledger census: 19 fail shapes, 16 bookkeeping, 3 structural", () => {
+		expect(corpus.rows).toHaveLength(19);
+		expect(corpus.rows.filter((r) => r.class === "bookkeeping")).toHaveLength(16);
+		expect(corpus.rows.filter((r) => r.class === "structural")).toHaveLength(3);
+		expect(corpus.rows.every((r) => r.pass === false)).toBe(true);
+	});
+
+	it("classifies exactly the marker-emitted bookkeeping shapes seed-only; structural never", () => {
+		const seedOnly = corpus.rows.filter((r) => seedOnlyFindings(r));
+		expect(seedOnly).toHaveLength(8);
+		expect(seedOnly.every((r) => r.class === "bookkeeping" && r.remedy === "cite")).toBe(true);
+		// fail-closed: a structural demand (a re-cut) never routes to the lift
+		expect(corpus.rows.filter((r) => r.class === "structural").every((r) => !seedOnlyFindings(r))).toBe(true);
+		// the marker-omitted bookkeeping half carries no `requires` on the trail
+		// and classifies not seed-only today — the grade skill's requires
+		// emission contract owns that residual, not the engine
+		expect(corpus.rows.filter((r) => r.class === "bookkeeping" && !seedOnlyFindings(r))).toHaveLength(8);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -3251,12 +3722,15 @@ describe("build audit-drop fixes", () => {
 	// reconstructing them from verdict prose. Regression guard against a future
 	// narrowing of the reads arrays (and against wrongly adding subplans to code-fix).
 	describe("plan-fix/code-fix read their lineage sources (phase 4)", () => {
-		it("build plan-fix reads goal, research, and subplans alongside the verdict/cite-check channels", () => {
+		it("build plan-fix reads goal, acceptance, research, and subplans alongside the verdict/cite-check channels", () => {
+			// `acceptance` rides along so a completeness finding naming an inventory
+			// id is repaired in the plan's `acceptance:` block against a real id.
 			expect(findWorkflow("build").stages["plan-fix"]?.reads).toEqual([
 				"plans",
 				fanin("plan-verdicts"),
 				fanin("plan-cite-check"),
 				"goal",
+				"acceptance",
 				"research",
 				fanin("subplans"),
 			]);
@@ -3301,8 +3775,8 @@ describe("build audit-drop fixes", () => {
 			).toBe("slice-grade");
 		});
 
-		it("slice-check declares slice-design and slice-grade as its only targets", () => {
-			expect([...(edge("slice-check").targets ?? [])].sort()).toEqual(["slice-design", "slice-grade"]);
+		it("slice-check declares slice-design, slice-fix (stuck lifts), and slice-grade as its only targets", () => {
+			expect([...(edge("slice-check").targets ?? [])].sort()).toEqual(["slice-design", "slice-fix", "slice-grade"]);
 		});
 
 		it("plan-cite-check skips straight to code when every dimension + risk flag already passes", () => {
@@ -3323,7 +3797,7 @@ describe("build audit-drop fixes", () => {
 			).toBe("plan-grade");
 		});
 
-		it("plan-cite-check routes into plan-grade when a fix left the cite floor red (degenerate)", () => {
+		it("plan-cite-check routes into plan-grade when a fix left ONLY the cite floor red", () => {
 			expect(
 				routeFrom("plan-cite-check", {
 					"plan-cite-check": [dimVerdict("structure", false)],
@@ -3344,6 +3818,15 @@ describe("build audit-drop fixes", () => {
 			).toBe("plan-grade");
 		});
 
+		it("an advisory-only floor verdict is green at this route", () => {
+			expect(
+				routeFrom("plan-cite-check", {
+					"plan-cite-check": [dimVerdict("structure", false, { severity: "low" })],
+					"plan-verdicts": [dimVerdict("completeness", true), dimVerdict("correctness", true)],
+				}),
+			).toBe("code");
+		});
+
 		it("plan-cite-check declares code and plan-grade as its only targets", () => {
 			expect([...(edge("plan-cite-check").targets ?? [])].sort()).toEqual(["code", "plan-grade"]);
 		});
@@ -3360,7 +3843,7 @@ describe("build audit-drop fixes", () => {
 			).toBe("implement");
 		});
 
-		it("code-cite-check routes into code-grade while the code cite floor is red", () => {
+		it("code-cite-check routes into code-grade while the code cite floor is the only red", () => {
 			expect(
 				routeFrom("code-cite-check", {
 					"code-cite-check": [dimVerdict("structure", false)],
@@ -3369,8 +3852,444 @@ describe("build audit-drop fixes", () => {
 			).toBe("code-grade");
 		});
 
-		it("code-cite-check declares implement and code-grade as its only targets", () => {
+		it("code-cite-check declares code-grade and implement as its only targets", () => {
 			expect([...(edge("code-cite-check").targets ?? [])].sort()).toEqual(["code-grade", "implement"]);
+		});
+	});
+
+	// P2e — the cite-check edges collapsed to two-way gates (skip arm + panel
+	// lap; the divert-to-snapshot arm died with its predicate). Run 3212 recorded
+	// four cite-check routing decisions under the OLD three-way edges; the
+	// committed excerpt re-derives from the on-disk trail by its `_meta` rules
+	// and must reproduce all four decisions under the collapsed edges — the
+	// routing semantics the collapse promised to preserve.
+	describe("3212 cite-check routing replay (collapsed two-way edges)", () => {
+		type StageRow = { type?: undefined; stageNumber: number; channel: string; output: Output };
+		type RoutingRow = { type: "routing"; fromStage: string; decision: string };
+		const rows = (
+			JSON.parse(
+				readFileSync(
+					fileURLToPath(new URL("./built-ins/__fixtures__/run-3212-cite-check-routing.json", import.meta.url)),
+					"utf-8",
+				),
+			) as { rows: Array<StageRow | RoutingRow> }
+		).rows;
+		const routeFrom = (stage: string, named: Record<string, unknown>) =>
+			edge(stage)({ output: undefined, state: { named } as unknown as RunView });
+
+		it("folds the excerpted trail rows in order and reproduces every recorded cite-check routing decision", () => {
+			const named: Record<string, Output[]> = {};
+			const decisions: string[] = [];
+			let last = 0;
+			for (const row of rows) {
+				if (row.type === "routing") {
+					decisions.push(row.decision);
+					expect(routeFrom(row.fromStage, named)).toBe(row.decision);
+					continue;
+				}
+				// The excerpt keeps the trail's stage order — a fold that reordered
+				// rows would be deriving a different run.
+				expect(row.stageNumber, "excerpt keeps stageNumbers ascending").toBeGreaterThan(last);
+				last = row.stageNumber;
+				named[row.channel] = (named[row.channel] ?? []).concat(row.output);
+			}
+			// All four recorded decisions under the collapsed edges (plan-grade ×2,
+			// code-grade ×2) — the replay's discharge of the routing-equivalence risk.
+			expect(decisions.filter((d) => d === "plan-grade")).toHaveLength(2);
+			expect(decisions.filter((d) => d === "code-grade")).toHaveLength(2);
+		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Converging-loop replay — the recorded cap-halt trails re-derived through the
+// real blocking folds and the whole-lap progress rule. Six committed fixtures
+// (each a trimmed excerpt of a gitignored run trail, re-derivable by its
+// `_meta` rules) pin two layers per trail: the per-lap verdicts the rule
+// assigns — which re-entries a panel hook waives — and the guard simulation
+// over those verdicts, where re-entry 1 is always unknown-counting and the run
+// halts when the count exceeds the recorded max. Local halt trails 089a,
+// 8b79, e9f4, 7514 plus the two external research tuples cc02 and ec5e as
+// plain data, a carry-forward synthetic, and the no-hook elaborate evidence
+// whose older halt wording is the no-panel marker.
+// ---------------------------------------------------------------------------
+describe("converging-loop replay pinning (local halts + external tuples + carry-forward)", () => {
+	type StageRow = { type?: undefined; stageNumber: number; stage: string; channel: string; output: Output };
+	type RoutingRow = { type: "routing"; fromStage: string; decision: string };
+	type HaltRow = { type: "halt"; stage: string; errMsg: string };
+	type FixtureRow = StageRow | RoutingRow | HaltRow;
+
+	// Fail-loud loader: every fixture names its run in `_meta.run_id`, the file
+	// name carries the same 4-hex run token, and stage numbers ascend in trail
+	// order — a fixture that silently lost any of these would pin a different
+	// run's shape.
+	const parseRunFixture = (parsed: unknown, file: string): FixtureRow[] => {
+		const token = file.match(/^run-([0-9a-f]{4})-/)?.[1];
+		const meta = (parsed as { _meta?: { run_id?: unknown } })?._meta;
+		const rows = (parsed as { rows?: unknown })?.rows;
+		if (typeof token !== "string" || typeof meta?.run_id !== "string" || !Array.isArray(rows)) {
+			throw new Error(
+				`fixture ${file} is not a run excerpt: expected _meta.run_id for run ${token ?? "?"} and a rows[] array`,
+			);
+		}
+		if (!meta.run_id.endsWith(`-${token}`)) {
+			throw new Error(`fixture ${file}: _meta.run_id "${meta.run_id}" does not name run prefix ${token}`);
+		}
+		let last = 0;
+		for (const row of rows as FixtureRow[]) {
+			if (row.type === undefined) {
+				if (typeof row.stageNumber !== "number" || row.stageNumber <= last) {
+					throw new Error(`fixture ${file}: stageNumbers must ascend in trail order`);
+				}
+				last = row.stageNumber;
+			}
+		}
+		return rows as FixtureRow[];
+	};
+	const loadRunFixture = (file: string): FixtureRow[] =>
+		parseRunFixture(
+			JSON.parse(readFileSync(fileURLToPath(new URL(`./built-ins/__fixtures__/${file}`, import.meta.url)), "utf-8")),
+			file,
+		);
+
+	type Lane = { verdictChannel: string; artifactChannel: string; dimensions: readonly string[]; gradedStage: string };
+	const CODE_LANE: Lane = {
+		verdictChannel: "code-verdicts",
+		artifactChannel: "plans",
+		dimensions: PLAN_DIMENSIONS,
+		gradedStage: "code-grade",
+	};
+	const SLICE_LANE: Lane = {
+		verdictChannel: "slice-verdicts",
+		artifactChannel: "slices",
+		dimensions: SLICE_DIMENSIONS,
+		gradedStage: "slice-grade",
+	};
+
+	// The blocking count over real machinery only: the roster the tier picks,
+	// freshness against the lane's artifact, latest-per-dimension, and the
+	// exported blocking predicate. Never a re-implementation.
+	const countBlocking = (named: Record<string, Output[]>, lane: Lane): number => {
+		const state = { named } as unknown as RunView;
+		const roster = gateRoster(gateTier(state, lane.verdictChannel), lane.dimensions);
+		const fresh = freshVerdicts(named[lane.verdictChannel] ?? [], latestArtifactPath(state, lane.artifactChannel));
+		const latest = latestVerdictPerDimension(fresh);
+		return roster.filter((d) => verdictBlocks(latest.get(d)?.data as VerdictRecord | undefined)).length;
+	};
+
+	// ONE trail-order round rule for all lanes: a round is a maximal run of
+	// verdict-channel stage rows (routing rows are transparent — a confirm
+	// verdict extends the round it confirms), closed by any different-channel
+	// stage row. The blocking count is folded at the round's end, BEFORE the
+	// closer's own channel entry lands, so a fix that regenerates the graded
+	// artifact cannot retroactively drop the round's verdicts. Fixture meta is
+	// trimmed, so the live ts-based cuts cannot run here — trail order is the
+	// only round delimiter.
+	const replay = (rows: FixtureRow[], lane: Lane) => {
+		const named: Record<string, Output[]> = {};
+		const blocking: number[] = [];
+		let reentryCount = 0;
+		let runOpen = false;
+		let firstDispatch = true;
+		let halt: HaltRow | undefined;
+		for (const row of rows) {
+			if (row.type === "routing") {
+				if (row.decision === lane.gradedStage) {
+					if (firstDispatch) {
+						firstDispatch = false;
+					} else {
+						reentryCount++;
+					}
+				}
+				continue;
+			}
+			if (row.type === "halt") {
+				halt = row;
+				continue;
+			}
+			if (row.channel === lane.verdictChannel) {
+				runOpen = true;
+			} else if (runOpen) {
+				blocking.push(countBlocking(named, lane));
+				runOpen = false;
+			}
+			named[row.channel] = (named[row.channel] ?? []).concat(row.output);
+		}
+		return { blocking, reentryCount, halt };
+	};
+
+	// Layer A: the verdict each lap earns off the derived counts. Layer B: the
+	// live guard simulation over those verdicts — re-entry 1 is always unknown
+	// and counts, improved re-entries waive, the run halts at the re-entry
+	// whose increment exceeds the recorded max.
+	const simulateGuard = (blocking: readonly number[], max: number) => {
+		const views: ProgressValue[] = blocking.map((b, k) => progressFromRoundCounts(blocking.slice(0, k), b));
+		let counted = 0;
+		let haltAt: number | null = null;
+		views.forEach((view, k) => {
+			if (view !== "improved") {
+				counted++;
+				if (counted > max && haltAt === null) haltAt = k + 1;
+			}
+		});
+		return { views, counted, haltAt };
+	};
+
+	const pinPanelFixture = (spec: {
+		file: string;
+		lane: Lane;
+		blocking: number[];
+		laps: ProgressValue[];
+		countedLaps: number;
+		views: ProgressValue[];
+		haltsAtReentry: number | null;
+	}) => {
+		const { blocking, reentryCount, halt } = replay(loadRunFixture(spec.file), spec.lane);
+		if (!halt) throw new Error(`fixture ${spec.file}: no halt row`);
+		expect(blocking, `${spec.file} per-round blocking counts`).toEqual(spec.blocking);
+		const laps = blocking.slice(1).map((b, j) => progressFromRoundCounts(blocking.slice(0, j + 1), b));
+		expect(laps, `${spec.file} per-lap verdicts`).toEqual(spec.laps);
+		expect(
+			laps.filter((v) => v !== "improved"),
+			`${spec.file} counted laps`,
+		).toHaveLength(spec.countedLaps);
+		const recorded = halt.errMsg.match(/re-entered (\d+) times \(max (\d+)\)/);
+		expect(recorded, `${spec.file} panel-era halt wording`).not.toBeNull();
+		const recordedReentries = Number(recorded?.[1]);
+		const max = Number(recorded?.[2]);
+		expect(reentryCount, `${spec.file} re-entries in the excerpt`).toBe(blocking.length);
+		expect(recordedReentries, `${spec.file} recorded halt consumed every re-entry`).toBe(reentryCount);
+		const sim = simulateGuard(blocking, max);
+		expect(sim.views, `${spec.file} simulated re-entry verdicts`).toEqual(spec.views);
+		expect(sim.views[0], `${spec.file} first re-entry is always unknown`).toBe("unknown");
+		if (spec.haltsAtReentry === null) {
+			expect(sim.haltAt, `${spec.file} converging trail continues under the whole-lap rule`).toBeNull();
+		} else {
+			expect(sim.haltAt, `${spec.file} halts at the recorded re-entry under both guards`).toBe(spec.haltsAtReentry);
+			expect(recordedReentries).toBe(spec.haltsAtReentry);
+		}
+	};
+
+	it("loader is fail-loud: missing _meta.run_id, a mismatched run prefix, or non-ascending stageNumbers each throw naming the fixture", () => {
+		expect(() => parseRunFixture({ rows: [] }, "run-089a-code-grade-cap.json")).toThrow(
+			/run-089a-code-grade-cap\.json/,
+		);
+		expect(() =>
+			parseRunFixture({ _meta: { run_id: "2026-09-01_11-34-37-dead" }, rows: [] }, "run-089a-code-grade-cap.json"),
+		).toThrow(/089a/);
+		expect(() =>
+			parseRunFixture(
+				{
+					_meta: { run_id: "2026-09-01_11-34-37-089a" },
+					rows: [
+						{ stageNumber: 5, stage: "s", channel: "c", output: {} as Output },
+						{ stageNumber: 5, stage: "s", channel: "c", output: {} as Output },
+					],
+				},
+				"run-089a-code-grade-cap.json",
+			),
+		).toThrow(/ascend/);
+	});
+
+	it("089a: converging code lane — blocking 3/2/1/1, improving laps waive, the cap never trips", () => {
+		pinPanelFixture({
+			file: "run-089a-code-grade-cap.json",
+			lane: CODE_LANE,
+			blocking: [3, 2, 1, 1],
+			laps: ["improved", "improved", "unchanged"],
+			countedLaps: 1,
+			views: ["unknown", "improved", "improved", "unchanged"],
+			haltsAtReentry: null,
+		});
+	});
+
+	it("8b79: converged panel over a persistent floor — blocking 1/0/0, the whole-lap rule continues past the recorded halt", () => {
+		pinPanelFixture({
+			file: "run-8b79-code-grade-cap.json",
+			lane: CODE_LANE,
+			blocking: [1, 0, 0],
+			laps: ["improved", "unchanged"],
+			countedLaps: 1,
+			views: ["unknown", "improved", "unchanged"],
+			haltsAtReentry: null,
+		});
+	});
+
+	it("e9f4: never-improving trail — blocking 1/1/2/1, halts at re-entry 4 under both guards", () => {
+		pinPanelFixture({
+			file: "run-e9f4-code-grade-cap.json",
+			lane: CODE_LANE,
+			blocking: [1, 1, 2, 1],
+			laps: ["unchanged", "regressed", "unchanged"],
+			countedLaps: 3,
+			views: ["unknown", "unchanged", "regressed", "unchanged"],
+			haltsAtReentry: 4,
+		});
+	});
+
+	it("7514: slice lane — blocking 1/1/1/1, halts at re-entry 4 under both guards", () => {
+		pinPanelFixture({
+			file: "run-7514-slice-grade-cap.json",
+			lane: SLICE_LANE,
+			blocking: [1, 1, 1, 1],
+			laps: ["unchanged", "unchanged", "unchanged"],
+			countedLaps: 3,
+			views: ["unknown", "unchanged", "unchanged", "unchanged"],
+			haltsAtReentry: 4,
+		});
+	});
+
+	it("7514: the verbatim slice-lane panel hook over the same fixture reads one merged R3/R4 basename run and never waives", () => {
+		const rows = loadRunFixture("run-7514-slice-grade-cap.json");
+		const named: Record<string, Output[]> = {};
+		const verdicts: ProgressValue[] = [];
+		let firstDispatch = true;
+		for (const row of rows) {
+			if (row.type === "routing") {
+				if (row.decision === "slice-grade") {
+					if (firstDispatch) {
+						firstDispatch = false;
+					} else {
+						// Rounds 3 and 4 share one artifact basename — the in-place
+						// amend — so basename grouping merges them into a single
+						// current round whose fold keeps the newest verdict per
+						// dimension and stays blocking.
+						verdicts.push(SLICE_PANEL_PROGRESS({ named } as unknown as RunView));
+					}
+				}
+				continue;
+			}
+			if (row.type === undefined) {
+				named[row.channel] = (named[row.channel] ?? []).concat(row.output);
+			}
+		}
+		expect(verdicts).toEqual(["unknown", "unchanged", "unchanged", "unchanged"]);
+	});
+
+	it("external tuples: both research trails convert to 2-of-3 counted laps under the rule core", () => {
+		// Scores as data, read by nothing else — the recorded external tuples.
+		const cc02 = [2, 3, 1, 1];
+		const cc02Laps = cc02.slice(1).map((b, j) => progressFromRoundCounts(cc02.slice(0, j + 1), b));
+		expect(cc02Laps).toEqual(["regressed", "improved", "unchanged"]);
+		expect(cc02Laps.filter((v) => v !== "improved")).toHaveLength(2);
+		const ec5e = [2, 1, 2, 1];
+		const ec5eLaps = ec5e.slice(1).map((b, j) => progressFromRoundCounts(ec5e.slice(0, j + 1), b));
+		expect(ec5eLaps).toEqual(["improved", "regressed", "unchanged"]);
+		expect(ec5eLaps.filter((v) => v !== "improved")).toHaveLength(2);
+	});
+
+	it("carry-forward: an in-place artifact keeps carried verdicts; a regenerated basename drops them", () => {
+		const PLAN = ".rpiv/artifacts/plans/2026-09-01_13-01-59_runtime-supervisor-lane.md";
+		const REGENERATED = ".rpiv/artifacts/plans/2026-09-01_13-01-60_runtime-supervisor-lane.md";
+		const verdict = (dimension: string, pass: boolean, artifact: string): Output =>
+			({
+				artifacts: [],
+				kind: "json",
+				meta: {},
+				data: { dimension, pass, severity: pass ? "none" : "medium", artifact },
+			}) as unknown as Output;
+		const plan = (path: string): Output =>
+			({
+				artifacts: [{ handle: { kind: "fs", path } }],
+				kind: "artifact-md",
+				meta: {},
+				data: { phase_count: 8 },
+			}) as unknown as Output;
+		const round1 = PLAN_DIMENSIONS.map((d) =>
+			verdict(d, d === "completeness" || d === "correctness" ? false : true, PLAN),
+		);
+		const state1: Record<string, Output[]> = { plans: [plan(PLAN)], "code-verdicts": round1 };
+		const first = countBlocking(state1, CODE_LANE);
+		expect(first).toBe(2);
+		// Round 2 selectively re-grades only the two blocking dimensions, in
+		// place: the cumulative fold carries the three passing verdicts forward.
+		const selective: Record<string, Output[]> = {
+			plans: [plan(PLAN)],
+			"code-verdicts": [...round1, verdict("completeness", true, PLAN), verdict("correctness", true, PLAN)],
+		};
+		const second = countBlocking(selective, CODE_LANE);
+		expect(second).toBe(0);
+		const fullRoster: Record<string, Output[]> = {
+			plans: [plan(PLAN)],
+			"code-verdicts": [...round1, ...PLAN_DIMENSIONS.map((d) => verdict(d, true, PLAN))],
+		};
+		expect(countBlocking(fullRoster, CODE_LANE), "cumulative fold equals the full-roster form").toBe(second);
+		expect(progressFromRoundCounts([first], second)).toBe("improved");
+		// Control: round 2 regenerated the artifact — the carried verdicts judge
+		// a document the channel has since replaced, so freshness drops them and
+		// their roster dimensions count as blocking again.
+		const regen: Record<string, Output[]> = {
+			plans: [plan(REGENERATED)],
+			"code-verdicts": [
+				...round1,
+				verdict("completeness", true, REGENERATED),
+				verdict("correctness", true, REGENERATED),
+			],
+		};
+		expect(countBlocking(regen, CODE_LANE)).toBe(3);
+	});
+
+	describe("no-hook loops: every re-entry counts — elaborate halts", () => {
+		const pinElaborateFixture = (file: string) => {
+			const rows = loadRunFixture(file);
+			const halt = rows.find((r): r is HaltRow => r.type === "halt");
+			if (!halt) throw new Error(`fixture ${file}: no halt row`);
+			// The older wording is the no-panel marker: elaborate carries no panel
+			// lane, so no progress hook exists and counting is the correct guard.
+			const recorded = halt.errMsg.match(/^Backward-jump limit exceeded: (\d+) backward jumps \(max (\d+)\)$/);
+			expect(recorded, `${file} keeps the pre-panel halt wording`).not.toBeNull();
+			const recordedReentries = Number(recorded?.[1]);
+			const max = Number(recorded?.[2]);
+			const dispatches = rows.filter((r): r is RoutingRow => r.type === "routing" && r.decision === halt.stage);
+			expect(dispatches.length, `${file} first visit plus re-entries`).toBe(recordedReentries + 1);
+			let counted = 0;
+			let haltedAt = 0;
+			for (let i = 1; i < dispatches.length; i++) {
+				counted++;
+				if (counted > max) {
+					haltedAt = i;
+					break;
+				}
+			}
+			expect(haltedAt, `${file} halts at the recorded re-entry`).toBe(recordedReentries);
+			expect(haltedAt, `${file} last routing row is the halted dispatch`).toBe(dispatches.length - 1);
+		};
+
+		it("65fc: halts at the recorded third re-entry under the counting-only guard", () => {
+			pinElaborateFixture("run-65fc-elaborate-cap.json");
+		});
+
+		it("caf9: same shape — the last routing row is the halted dispatch", () => {
+			pinElaborateFixture("run-caf9-elaborate-cap.json");
+		});
+
+		it("live-records complement: no built-in stage outside the four panel lanes declares a progress hook", () => {
+			const panelStages = new Set([
+				"slice-grade",
+				"slice-fix",
+				"slice-seed-lift",
+				"plan-grade",
+				"plan-confirm",
+				"plan-snapshot",
+				"code-grade",
+				"code-confirm",
+				"code-snapshot",
+				"grade",
+			]);
+			const hooked: string[] = [];
+			for (const workflow of builtInWorkflows) {
+				for (const [stage, def] of Object.entries(workflow.stages)) {
+					if ((def as { progress?: unknown } | undefined)?.progress !== undefined) {
+						hooked.push(`${workflow.name}:${stage}`);
+					}
+				}
+			}
+			// The complement direction: every hooked stage is a panel-lane
+			// destination. Non-panel loops — elaborate, reconcile-fix,
+			// validate-fix — and the plain forward edges stay hook-less.
+			for (const id of hooked) {
+				expect(panelStages.has(id.split(":")[1]), `${id} is not a panel-lane stage`).toBe(true);
+			}
 		});
 	});
 });
@@ -3546,10 +4465,14 @@ describe("plan/code gate risk-ruling evidence + verify-at-implement duty (phase 
 	});
 
 	describe("re-open coherence (dimensionsToRegrade clause 3)", () => {
-		it("a demoted mechanics pass on correctness re-opens correctness in the re-grade set", async () => {
+		it("a demoted mechanics pass on a LEGACY correctness verdict re-opens correctness, and the never-ruled risk unit joins it", async () => {
 			// full roster (no slices signal ⇒ standard tier); every dimension
 			// passes with a FRESH verdict (artifact: PLAN), only correctness
-			// carries a demoted mechanics pass ⇒ only correctness re-grades.
+			// carries a demoted mechanics pass ⇒ correctness re-grades (clause 3
+			// is dimension-agnostic, so a pre-split trail whose correctness
+			// verdict still carries rulings re-opens exactly as before). The plan
+			// declares risks: and no `risk-rulings` verdict exists yet, so the
+			// risk unit is pending too — never graded ⇒ must grade at least once.
 			const verdicts = PLAN_DIMS.map((d) =>
 				d === "correctness"
 					? verdict(d, true, { artifact: PLAN, risk_rulings: [{ id: "r1", pass: true, claim_type: "mechanics" }] })
@@ -3558,9 +4481,10 @@ describe("plan/code gate risk-ruling evidence + verify-at-implement duty (phase 
 			expect(
 				await gradeLabels("plan-grade", {
 					plans: [chan(PLAN, { risks: [{ id: "r1", claim_type: "mechanics" }] })],
+					"plan-cite-check": [chan(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
 					"plan-verdicts": verdicts,
 				}),
-			).toEqual(["correctness"]);
+			).toEqual(["correctness", "risk-rulings"]);
 		});
 	});
 
@@ -4618,13 +5542,39 @@ describe("build subplan cluster fanout (research threading + fail-loud mapping)"
 		expect(units.every((u) => u.prompt.includes("--as-subplan"))).toBe(true);
 	});
 
-	it("build plan stage reads research alongside the subplans fan-in (finding 4)", () => {
-		expect(findWorkflow("build").stages.plan?.reads).toEqual(["research", fanin("subplans")]);
+	it("build plan stage reads research, goal, and acceptance alongside the subplans fan-in (finding 4)", () => {
+		// Same-anchor wiring as ship's plan stage: the root merge sees the goal and
+		// the frozen inventory the completeness judge and validate read, so it can
+		// dispose of every inventory id in the plan's `acceptance:` block.
+		expect(findWorkflow("build").stages.plan?.reads).toEqual(["research", "goal", "acceptance", fanin("subplans")]);
 	});
 
 	// Finding 8 — an artifact whose identity can't be resolved must FAIL LOUD, not
 	// fall back to a positional guess that silently mis-routes and drops slices.
-	it("throws when a design filename carries no slice-<N> token (no positional fallback)", () => {
+	// The observed halt: a lane dropped the `_slice-3_` segment while its
+	// frontmatter `slice_n: 3` was right. The channel carries that frontmatter as
+	// `output.data`, so identity resolves from it and the filename is the fallback.
+	it("resolves a tokenless design filename from the channel's data.slice_n", async () => {
+		twoIndependentSlices();
+		const units = await subplanLoop().units({
+			cwd: tmpDir,
+			artifact: undefined,
+			state: {
+				named: {
+					slices: [out(sliceMap)],
+					designs: [
+						{ ...out(".rpiv/artifacts/designs/lv-2-the-face.md"), data: { slice_n: 1 } },
+						out(".rpiv/artifacts/designs/d_slice-2.md"),
+					],
+				},
+			} as unknown as RunView,
+		});
+		const prompts = units.map((u) => u.prompt).join("\n");
+		expect(prompts).toContain("--designs .rpiv/artifacts/designs/lv-2-the-face.md");
+		expect(prompts).toContain("--designs .rpiv/artifacts/designs/d_slice-2.md");
+	});
+
+	it("throws when a design carries neither slice_n nor a slice-<N> filename token (no positional fallback)", () => {
 		twoIndependentSlices();
 		expect(() =>
 			subplanLoop().units({
@@ -4637,7 +5587,7 @@ describe("build subplan cluster fanout (research threading + fail-loud mapping)"
 					},
 				} as unknown as RunView,
 			}),
-		).toThrow(/no 'slice-<N>' token|has no slice number/);
+		).toThrow(/no frontmatter 'slice_n' and no 'slice-<N>' filename token|has no slice number/);
 	});
 
 	it("takes the LATEST design when a slice is claimed twice (design-review re-emits — latest-wins, no throw)", async () => {
@@ -5525,6 +6475,28 @@ describe("build grade panel re-grades only the pending dimensions (P2)", () => {
 	const PLAN_DIMS = ["completeness", "correctness", "actionability", "pattern-following", "architecture-fit"];
 	const REL = ".rpiv/artifacts/plans/p.md";
 
+	// The fail-closed cite contract: every cite-configured panel requires its
+	// floor's verdict on the state (citeCheckFlag throws otherwise) — spread at
+	// every units() call below. Both channels: the helper is stage-generic.
+	const citeChannels = {
+		"plan-cite-check": [
+			{
+				artifacts: [{ handle: fsHandle(".rpiv/artifacts/verdicts/plan-cite-check__p.json") }],
+				data: undefined,
+				kind: "",
+				meta: {},
+			},
+		],
+		"code-cite-check": [
+			{
+				artifacts: [{ handle: fsHandle(".rpiv/artifacts/verdicts/code-cite-check__p.json") }],
+				data: undefined,
+				kind: "",
+				meta: {},
+			},
+		],
+	};
+
 	const gradeUnits = (stage: string) => {
 		const loop = findWorkflow("build").stages[stage]?.loop;
 		if (loop?.kind !== "fanout") throw new Error(`build ${stage} stage has no fanout loop`);
@@ -5548,6 +6520,7 @@ describe("build grade panel re-grades only the pending dimensions (P2)", () => {
 			state: {
 				named: {
 					plans: [{ artifacts: [{ handle: fsHandle(REL) }], data: undefined, kind: "", meta: {} }],
+					...citeChannels,
 					[verdictChannel]: verdicts,
 				},
 			} as unknown as RunView,
@@ -5586,6 +6559,7 @@ describe("build grade panel re-grades only the pending dimensions (P2)", () => {
 			state: {
 				named: {
 					plans: [{ artifacts: [{ handle: fsHandle(REL) }], data: undefined, kind: "", meta: {} }],
+					...citeChannels,
 					"plan-verdicts": verdicts,
 					"plan-snapshot": [
 						{
@@ -5714,6 +6688,7 @@ describe("build grade panel re-grades only the pending dimensions (P2)", () => {
 			state: {
 				named: {
 					plans: [{ artifacts: [{ handle: fsHandle(REL) }], data: undefined, kind: "", meta: {} }],
+					...citeChannels,
 					"plan-verdicts": PLAN_DIMS.map((d) => dimV(d, false)),
 					"code-verdicts": codeVerdicts,
 				},
@@ -5886,6 +6861,7 @@ describe("build grade panel re-grades only the pending dimensions (P2)", () => {
 			state: {
 				named: {
 					plans: [{ artifacts: [{ handle: fsHandle(REL) }], data: undefined, kind: "", meta: {} }],
+					...citeChannels,
 					"plan-verdicts": verdicts,
 					"plan-snapshot": [
 						{
@@ -5940,7 +6916,9 @@ describe("build snapshot stages publish a prior sidecar off the plans channel (d
 			expect(out.artifacts).toHaveLength(1);
 			expect(out.artifacts[0].role).toBe("prior");
 			expect(out.artifacts[0].handle.kind).toBe("fs");
-			expect(out.artifacts[0].handle.path).toBe(".rpiv/artifacts/priors/p.md");
+			// Per-round file published (round 1 here); the basename-keyed copy is written beside it.
+			expect(out.artifacts[0].handle.path).toBe(".rpiv/artifacts/priors/p.r1.md");
+			expect(readFileSync(join(tmpDir, ".rpiv/artifacts/priors/p.r1.md"), "utf-8")).toBe(planBody);
 			expect(out.data.snapshot_of).toBe(REL);
 			// The prior file is a byte copy of the plan — the pre-fix content the
 			// re-grade diffs against.
@@ -5998,17 +6976,26 @@ describe("build adaptive gate scaling (tier / roster / freshness / confirm)", ()
 		slices: [chan(".rpiv/artifacts/slices/s.md", { slice_count: 1 })],
 		plans: [chan(PLAN, { phase_count: 1 })],
 	};
+	// The fail-closed cite contract: every cite-configured panel requires its
+	// floor's verdict on the state (citeCheckFlag throws otherwise) — spread at
+	// every gradeLabels site below (route sites construct their own channels).
+	const citeChannels = {
+		"plan-cite-check": [chan(".rpiv/artifacts/verdicts/plan-cite-check__p.json")],
+		"code-cite-check": [chan(".rpiv/artifacts/verdicts/code-cite-check__p.json")],
+	};
 
 	describe("tier → roster", () => {
 		it("light tier (1 slice, 1 phase, clean channel) grades correctness+completeness only", async () => {
-			expect(await gradeLabels("plan-grade", { ...lightSignals, "plan-verdicts": [] })).toEqual([
+			expect(await gradeLabels("plan-grade", { ...lightSignals, ...citeChannels, "plan-verdicts": [] })).toEqual([
 				"completeness",
 				"correctness",
 			]);
 		});
 
 		it("missing signals never yield light — full roster", async () => {
-			expect(await gradeLabels("plan-grade", { plans: [chan(PLAN)], "plan-verdicts": [] })).toEqual(PLAN_DIMS);
+			expect(await gradeLabels("plan-grade", { plans: [chan(PLAN)], ...citeChannels, "plan-verdicts": [] })).toEqual(
+				PLAN_DIMS,
+			);
 		});
 
 		it("strict signals (slice_count >= 5) keep the full roster", async () => {
@@ -6016,6 +7003,7 @@ describe("build adaptive gate scaling (tier / roster / freshness / confirm)", ()
 				await gradeLabels("plan-grade", {
 					slices: [chan(".rpiv/artifacts/slices/s.md", { slice_count: 7 })],
 					plans: [chan(PLAN, { phase_count: 1 })],
+					...citeChannels,
 					"plan-verdicts": [],
 				}),
 			).toEqual(PLAN_DIMS);
@@ -6024,6 +7012,7 @@ describe("build adaptive gate scaling (tier / roster / freshness / confirm)", ()
 		it("a medium verdict on the channel lifts a light run out of the light tier (roster widens)", async () => {
 			const labels = await gradeLabels("plan-grade", {
 				...lightSignals,
+				...citeChannels,
 				"plan-verdicts": [verdict("correctness", false)],
 			});
 			expect(labels).toEqual(PLAN_DIMS);
@@ -6041,6 +7030,7 @@ describe("build adaptive gate scaling (tier / roster / freshness / confirm)", ()
 			expect(
 				await gradeLabels("code-grade", {
 					...lightSignals,
+					...citeChannels,
 					"plan-verdicts": [verdict("correctness", false)],
 					"code-verdicts": [],
 				}),
@@ -6051,14 +7041,16 @@ describe("build adaptive gate scaling (tier / roster / freshness / confirm)", ()
 	describe("verdict freshness (artifact-identity invalidation)", () => {
 		it("verdicts judged against a REPLACED artifact do not carry — full re-grade", async () => {
 			const stale = PLAN_DIMS.map((d) => verdict(d, true, { artifact: ".rpiv/artifacts/plans/old.md" }));
-			expect(await gradeLabels("plan-grade", { plans: [chan(PLAN)], "plan-verdicts": stale })).toEqual(PLAN_DIMS);
+			expect(
+				await gradeLabels("plan-grade", { plans: [chan(PLAN)], ...citeChannels, "plan-verdicts": stale }),
+			).toEqual(PLAN_DIMS);
 		});
 
 		it("verdicts judged against the CURRENT artifact carry — only the failing dimension re-grades", async () => {
 			const verdicts = PLAN_DIMS.map((d) => verdict(d, d !== "correctness", { artifact: PLAN }));
-			expect(await gradeLabels("plan-grade", { plans: [chan(PLAN)], "plan-verdicts": verdicts })).toEqual([
-				"correctness",
-			]);
+			expect(
+				await gradeLabels("plan-grade", { plans: [chan(PLAN)], ...citeChannels, "plan-verdicts": verdicts }),
+			).toEqual(["correctness"]);
 		});
 
 		it("slice-check does NOT skip the re-grade after a re-slice (stale design-readiness verdict)", () => {
@@ -6106,6 +7098,137 @@ describe("build adaptive gate scaling (tier / roster / freshness / confirm)", ()
 					],
 				}),
 			).toBe("slice-grade");
+		});
+	});
+
+	describe("seed-only cite-remedy routing (three-way grade edge / stuck check edge)", () => {
+		const T_JUDGED2 = "2026-09-03T11:21:26.000Z";
+		const T_VERDICT2 = "2026-09-03T11:28:03.000Z";
+		const T_LIFT = "2026-09-03T11:31:00.000Z";
+		const T_RESLICE = "2026-09-03T11:35:04.000Z";
+		const MAP = ".rpiv/artifacts/slices/s2.md";
+		const tsVerdict = (pass: boolean, extra: Record<string, unknown> = {}, ts = T_VERDICT2): Output =>
+			({
+				artifacts: [],
+				kind: "json",
+				meta: { ts },
+				data: { dimension: "design-readiness", pass, severity: pass ? "none" : "medium", ...extra },
+			}) as unknown as Output;
+		const tsChan = (rel: string, data: Record<string, unknown>, ts: string): Output =>
+			({ artifacts: [{ handle: fsHandle(rel) }], data, kind: "", meta: { ts } }) as unknown as Output;
+		const tsLift = (ts: string): Output =>
+			({ artifacts: [], kind: "json", meta: { ts }, data: { lifted: [], skipped: [] } }) as unknown as Output;
+		const SEEDS = [
+			{ detail: "under-cited", where: "## Slice 2", requires: "src/alpha.ts:18-25" },
+			{ detail: "under-cited", where: "## Slice 3", requires: "src/beta.ts:30-40" },
+		];
+		const STRUCTURE_PASS = { "slice-check": [verdict("structure", true)] };
+
+		it("a seed-only fail (remedy cite) routes slice-grade to slice-seed-lift, never slice-fix", () => {
+			expect(
+				route("slice-grade", {
+					slices: [chan(MAP, { slice_count: 2 })],
+					...STRUCTURE_PASS,
+					"slice-verdicts": [tsVerdict(false, { remedy: "cite", findings: SEEDS })],
+				}),
+			).toBe("slice-seed-lift");
+		});
+
+		it("a remedy-absent seed-only fail routes the same way (the omitted-marker leak, closed engine-side)", () => {
+			expect(
+				route("slice-grade", {
+					slices: [chan(MAP, { slice_count: 2 })],
+					...STRUCTURE_PASS,
+					"slice-verdicts": [tsVerdict(false, { findings: SEEDS })],
+				}),
+			).toBe("slice-seed-lift");
+		});
+
+		it("a verdict mixing one finding without requires routes to slice-fix (today's path preserved)", () => {
+			expect(
+				route("slice-grade", {
+					slices: [chan(MAP, { slice_count: 2 })],
+					...STRUCTURE_PASS,
+					"slice-verdicts": [
+						tsVerdict(false, {
+							remedy: "cite",
+							findings: [{ detail: "bundles two decisions", where: "## Slice 1" }, ...SEEDS],
+						}),
+					],
+				}),
+			).toBe("slice-fix");
+		});
+
+		it("a lone no-requires finding routes to slice-fix the same way", () => {
+			expect(
+				route("slice-grade", {
+					slices: [chan(MAP, { slice_count: 2 })],
+					...STRUCTURE_PASS,
+					"slice-verdicts": [
+						tsVerdict(false, { findings: [{ detail: "an epic spanning two verticals", where: "## Slice 1" }] }),
+					],
+				}),
+			).toBe("slice-fix");
+		});
+
+		it("after a lift publication + clean structure stamp, slice-check routes straight to slice-design (no re-grade)", () => {
+			expect(
+				route("slice-check", {
+					slices: [chan(MAP, { slice_count: 2 })],
+					"slice-check": [verdict("structure", true, { citeDischarged: "s2.md" })],
+					"slice-verdicts": [tsVerdict(false, { remedy: "cite", findings: SEEDS, artifact: MAP })],
+					"slice-seed-lift": [tsLift(T_LIFT)],
+				}),
+			).toBe("slice-design");
+		});
+
+		it("a lift that left the gate red is stuck: slice-check routes to slice-fix, not another grade", () => {
+			expect(
+				route("slice-check", {
+					slices: [tsChan(MAP, { slice_count: 2 }, T_JUDGED2)],
+					"slice-check": [verdict("structure", true)], // no stamp — a seed was skipped
+					"slice-verdicts": [tsVerdict(false, { remedy: "cite", findings: SEEDS, artifact: MAP })],
+					"slice-seed-lift": [tsLift(T_LIFT)],
+				}),
+			).toBe("slice-fix");
+		});
+
+		it("a slices publication postdating the lift un-sticks the loop: slice-check routes to slice-grade", () => {
+			expect(
+				route("slice-check", {
+					slices: [
+						tsChan(MAP, { slice_count: 2 }, T_JUDGED2),
+						tsChan(".rpiv/artifacts/slices/s3.md", { slice_count: 2 }, T_RESLICE),
+					],
+					"slice-check": [verdict("structure", true)],
+					"slice-verdicts": [tsVerdict(false, { remedy: "cite", findings: SEEDS, artifact: MAP })],
+					"slice-seed-lift": [tsLift(T_LIFT)],
+				}),
+			).toBe("slice-grade");
+		});
+
+		it("a dead design-readiness unit takes the fix arm with the unit-failed note, AHEAD of the seed-only arm", () => {
+			// Upstream composition: a dimension-bearing sentinel is never a
+			// classification candidate — there is no verdict to classify — so the
+			// unit-failed arm fires before the seed-only check even with a prior
+			// seed-only verdict on the channel; the note is the observable that
+			// distinguishes the arm order (the seed-only fallthrough reaches the
+			// same target WITHOUT a note).
+			const named = {
+				slices: [chan(MAP, { slice_count: 2 })],
+				...STRUCTURE_PASS,
+				"slice-verdicts": [
+					tsVerdict(false, { remedy: "cite", findings: SEEDS }),
+					{
+						artifacts: [],
+						kind: "failed",
+						meta: { ts: T_LIFT },
+						data: { reason: "grade produced no verdict", dimension: "design-readiness" },
+					} as unknown as Output,
+				],
+			};
+			expect(route("slice-grade", named)).toBe("slice-fix");
+			expect(takeRouteNote(edge("slice-grade"))).toBe("unit-failed: design-readiness produced no verdict");
 		});
 	});
 
@@ -6633,6 +7756,289 @@ describe("build implement-scope-check (lane-level scope floor)", () => {
 		expect(String(data.feedback)).not.toMatch(/packages\/a\/x\.ts/);
 		expect(String(data.feedback)).not.toMatch(/packages\/b\/y\.ts/);
 	});
+
+	// Honest pass-through: the excess pick is a DEFERRAL, not a pass;
+	// its note names the downstream adjudicator so the recap's routingNotes
+	// surface it. takeRouteNote is read-and-clear, so each assertion drains
+	// what the pick just attached.
+	const edgeOf = (wf: string) => {
+		const edge = findWorkflow(wf).edges["implement-scope-check"];
+		if (typeof edge !== "function") throw new Error(`${wf} implement-scope-check edge is not an EdgeFn`);
+		return edge;
+	};
+	const routeState = (verdict: string) =>
+		({ named: { "implement-scope-check": [{ data: { verdict } }] } }) as unknown as RunView;
+
+	it("excess pick attaches the pass-through note naming validate; the pass pick attaches none", () => {
+		const edge = edgeOf("build");
+		expect((edge as EdgeFn)({ state: routeState("excess"), output: undefined })).toBe("reconcile");
+		expect(takeRouteNote(edge)).toBe("pass-through: implement-scope-check defers to validate");
+		// A clean pass needs no explanation.
+		expect((edge as EdgeFn)({ state: routeState("pass"), output: undefined })).toBe("reconcile");
+		expect(takeRouteNote(edge)).toBeUndefined();
+		// The quarantine arm and the integrity stop are unchanged: no note on
+		// untracked-only (its verdict speaks via the quarantine manifest), and the
+		// integrity stop keeps its own note.
+		expect((edge as EdgeFn)({ state: routeState("untracked-only"), output: undefined })).toBe("scope-quarantine");
+		expect(takeRouteNote(edge)).toBeUndefined();
+	});
+
+	it("vet twin: the excess pick names code-review (the review loop adjudicates, not validate)", () => {
+		const edge = edgeOf("vet");
+		expect((edge as EdgeFn)({ state: routeState("excess"), output: undefined })).toBe("reconcile");
+		expect(takeRouteNote(edge)).toBe("pass-through: implement-scope-check defers to code-review");
+	});
+
+	describe("validate-report scope acceptance", () => {
+		// Seed the two acceptance channels onto the floor's RunView: the latest
+		// validation row (data.verdict + data.blockers) and, when given, the
+		// latest remediation digest row whose meta.ts must STRICTLY postdate the
+		// report — the publication-order discriminator of a validate-fix hop.
+		const seedChannels = (opts: { validationTs: string; blockers?: unknown; remediationTs?: string }): RunView => {
+			const state = seed(
+				".rpiv/artifacts/plans/p.md",
+				plan(['"packages/a/foo.ts"'], 1),
+				".rpiv/artifacts/goal/baseline-t.json",
+				[],
+			) as { named: Record<string, unknown> };
+			state.named.validation = [
+				{
+					...out(".rpiv/artifacts/validation/r1.md"),
+					data: { verdict: "fail", blockers: opts.blockers },
+					meta: { ts: opts.validationTs },
+				},
+			];
+			if (opts.remediationTs !== undefined) {
+				state.named.remediation = [
+					{
+						...out(".rpiv/artifacts/plans/p.md"),
+						data: { changed: true },
+						meta: { ts: opts.remediationTs },
+					},
+				];
+			}
+			return state as unknown as RunView;
+		};
+		const blocker = (file: string) => ({ id: "b1", command: "npm test", file });
+
+		it("accepts a blocker-named dirty path on the validate-fix re-entry (verdict folds to pass, data + persisted JSON stamped)", () => {
+			const state = seedChannels({
+				validationTs: "2026-09-04T10:00:00-0400",
+				// Named twice (deduped) and out of order (sorted) — the accepted set is a
+				// deduped, sorted file list.
+				blockers: [blocker("packages/z/late.ts"), blocker("packages/b/fix.ts"), blocker("packages/b/fix.ts")],
+				remediationTs: "2026-09-04T11:00:00-0400",
+			});
+			dirty("packages/a/foo.ts"); // declared by the plan
+			dirty("packages/b/fix.ts"); // named by a blockers entry → accepted
+			dirty("packages/z/late.ts"); // named by a blockers entry → accepted
+			const result = scopeRun()({ cwd: tmpDir, input: undefined, state });
+			expect(result.data.pass).toBe(true);
+			expect(result.data.findings).toEqual([]);
+			expect(result.data.declaredBy).toBe("validate-report");
+			expect(result.data.accepted).toEqual(["packages/b/fix.ts", "packages/z/late.ts"]);
+			const persisted = JSON.parse(
+				readFileSync(join(tmpDir, ".rpiv/artifacts/verdicts/implement-scope-check__p.json"), "utf-8"),
+			);
+			expect(persisted.declaredBy).toBe("validate-report");
+			expect(persisted.accepted).toEqual(["packages/b/fix.ts", "packages/z/late.ts"]);
+		});
+
+		it("an UNNAMED dirty twin of the accepted hop stays the sole finding (the named path never rides --scope into validate)", () => {
+			const state = seedChannels({
+				validationTs: "2026-09-04T10:00:00-0400",
+				blockers: [blocker("packages/b/fix.ts")],
+				remediationTs: "2026-09-04T11:00:00-0400",
+			});
+			dirty("packages/a/foo.ts"); // declared
+			dirty("packages/b/fix.ts"); // named → accepted
+			dirty("packages/c/stray.ts"); // unnamed → the sole finding
+			const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+			expect(data.pass).toBe(false);
+			expect(data.verdict).toBe("excess");
+			expect(String(data.feedback)).toMatch(/packages\/c\/stray\.ts/);
+			expect(String(data.feedback)).not.toMatch(/packages\/b\/fix\.ts/);
+			expect((data.findings as { where: string }[]).map((f) => f.where)).toEqual(["packages/c/stray.ts"]);
+		});
+
+		it("refuses when the validation report is NEWER than the remediation (the re-validation shape)", () => {
+			const state = seedChannels({
+				validationTs: "2026-09-04T12:00:00-0400",
+				blockers: [blocker("packages/b/fix.ts")],
+				remediationTs: "2026-09-04T11:00:00-0400",
+			});
+			dirty("packages/a/foo.ts");
+			dirty("packages/b/fix.ts"); // named, but the newer report supersedes → finding
+			const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+			expect(data.pass).toBe(false);
+			expect(String(data.feedback)).toMatch(/packages\/b\/fix\.ts/);
+			expect(data.declaredBy).toBeUndefined();
+			expect(data.accepted).toBeUndefined();
+		});
+
+		it("refuses with no remediation row (the first entry / a quarantine re-entry)", () => {
+			const state = seedChannels({
+				validationTs: "2026-09-04T10:00:00-0400",
+				blockers: [blocker("packages/b/fix.ts")],
+			});
+			dirty("packages/a/foo.ts");
+			dirty("packages/b/fix.ts");
+			const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+			expect(data.pass).toBe(false);
+			expect(String(data.feedback)).toMatch(/packages\/b\/fix\.ts/);
+			expect(data.declaredBy).toBeUndefined();
+		});
+
+		it("refuses non-array blockers and skips malformed entries (fail-closed)", () => {
+			for (const malformed of ["oops", undefined, [{ no: "file" }]]) {
+				const state = seedChannels({
+					validationTs: "2026-09-04T10:00:00-0400",
+					blockers: malformed,
+					remediationTs: "2026-09-04T11:00:00-0400",
+				});
+				dirty("packages/a/foo.ts");
+				dirty("packages/b/fix.ts");
+				const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+				expect(data.pass, `blockers=${JSON.stringify(malformed)}`).toBe(false);
+				expect(String(data.feedback), `blockers=${JSON.stringify(malformed)}`).toMatch(/packages\/b\/fix\.ts/);
+			}
+		});
+
+		it("accepted paths match VERBATIM — no twin expansion (naming x.ts accepts x.ts, never x.test.ts)", () => {
+			const state = seedChannels({
+				validationTs: "2026-09-04T10:00:00-0400",
+				blockers: [blocker("packages/b/fix.ts")],
+				remediationTs: "2026-09-04T11:00:00-0400",
+			});
+			dirty("packages/a/foo.ts");
+			dirty("packages/b/fix.ts"); // named → accepted
+			dirty("packages/b/fix.test.ts"); // NOT named; acceptance is verbatim → finding
+			const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+			expect(data.pass).toBe(false);
+			expect((data.findings as { where: string }[]).map((f) => f.where)).toEqual(["packages/b/fix.test.ts"]);
+			expect(data.accepted).toEqual(["packages/b/fix.ts"]);
+		});
+
+		it("the stage reads stay [plans, goal] — acceptance reads defensively off state.named, never halting the first entry", () => {
+			// The acceptance reads `validation`/`remediation` off `state.named`
+			// WITHOUT declaring them: a declared read halts the first, pre-validate
+			// entry (channels still unfilled). Build and ship share the run function,
+			// so both stay reads-verbatim.
+			for (const name of ["build", "ship"]) {
+				expect(findWorkflow(name).stages["implement-scope-check"]?.reads, name).toEqual(["plans", "goal"]);
+			}
+		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Verdict envelope scores — the two deterministic verdict writers' tier arms,
+// pinned directly on the WRITERS (not the stages). `score`/`severity` have zero
+// routing consumers (gates key off `pass` + severity-floor folds); these pins
+// freeze what the persisted JSON says so a tier change can never drift
+// silently. Plain-findings emissions stay byte-identical to the pre-widening
+// shape: no `advisory` key, no `declaredBy`/`accepted` (key-omission idiom).
+// ---------------------------------------------------------------------------
+describe("verdict envelope scores (writeStructureVerdict / writeScopeVerdict)", () => {
+	let tmpDir: string;
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "rpiv-verdict-envelope-"));
+	});
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+	const fsHandle = { kind: "fs", path: ".rpiv/artifacts/plans/p.md" } as const;
+	const fsArtifact = { handle: { kind: "fs", path: ".rpiv/artifacts/plans/p.md" } } as const;
+	const structurePath = (who: string) => join(tmpDir, ".rpiv/artifacts/verdicts", `${who}__p.json`);
+	const scopePath = () => join(tmpDir, ".rpiv/artifacts/verdicts", "implement-scope-check__p.json");
+
+	it("writeStructureVerdict tiers: pass ⇒ 100/none, blocking ⇒ 0/high, all-advisory ⇒ null/low (data + persisted JSON)", () => {
+		const pass = writeStructureVerdict("structure-check", fsHandle, [], tmpDir);
+		expect(pass.data).toMatchObject({ dimension: "structure", pass: true, score: 100, severity: "none" });
+		const blocking = writeStructureVerdict("structure-check", fsHandle, [{ detail: "d", where: "w" }], tmpDir);
+		expect(blocking.data).toMatchObject({ pass: false, score: 0, severity: "high" });
+		const advisory = writeStructureVerdict(
+			"structure-check",
+			fsHandle,
+			[{ detail: "d", where: "w", advisory: true }],
+			tmpDir,
+		);
+		expect(advisory.data).toMatchObject({ pass: false, score: null, severity: "low" });
+		// The persisted JSON carries the same honest tiers.
+		expect(JSON.parse(readFileSync(structurePath("structure-check"), "utf-8"))).toMatchObject({
+			pass: false,
+			score: null,
+			severity: "low",
+		});
+	});
+
+	it("writeStructureVerdict plain-findings persisted JSON is byte-identical to the pre-widening shape", () => {
+		writeStructureVerdict("structure-check", fsHandle, [{ detail: "stale cite", where: "plans/p.md:12" }], tmpDir);
+		expect(readFileSync(structurePath("structure-check"), "utf-8")).toBe(
+			JSON.stringify(
+				{
+					dimension: "structure",
+					pass: false,
+					score: 0,
+					severity: "high",
+					artifact: ".rpiv/artifacts/plans/p.md",
+					findings: [{ detail: "stale cite", where: "plans/p.md:12" }],
+					feedback: "stale cite",
+				},
+				null,
+				2,
+			),
+		);
+	});
+
+	it("writeScopeVerdict tiers: pass ⇒ 100/none, untracked-only ⇒ 0/medium, excess ⇒ 0/high, advisory-only ⇒ null/low", () => {
+		const pass = writeScopeVerdict(fsArtifact, [], "pass", tmpDir);
+		expect(pass.data).toMatchObject({ dimension: "scope", pass: true, score: 100, severity: "none" });
+		const untracked = writeScopeVerdict(fsArtifact, [{ detail: "d", where: "w" }], "untracked-only", tmpDir);
+		expect(untracked.data).toMatchObject({ pass: false, score: 0, severity: "medium" });
+		const excess = writeScopeVerdict(fsArtifact, [{ detail: "d", where: "w" }], "excess", tmpDir);
+		expect(excess.data).toMatchObject({ pass: false, score: 0, severity: "high" });
+		const advisory = writeScopeVerdict(fsArtifact, [{ detail: "d", where: "w", advisory: true }], "excess", tmpDir);
+		expect(advisory.data).toMatchObject({ pass: false, score: null, severity: "low" });
+		expect(JSON.parse(readFileSync(scopePath(), "utf-8"))).toMatchObject({
+			pass: false,
+			score: null,
+			severity: "low",
+		});
+	});
+
+	it("writeScopeVerdict plain-findings persisted JSON is byte-identical (no advisory key, no declaredBy)", () => {
+		writeScopeVerdict(fsArtifact, [{ detail: "stray write", where: "packages/a/stray.ts" }], "excess", tmpDir);
+		expect(readFileSync(scopePath(), "utf-8")).toBe(
+			JSON.stringify(
+				{
+					dimension: "scope",
+					pass: false,
+					verdict: "excess",
+					score: 0,
+					severity: "high",
+					artifact: ".rpiv/artifacts/plans/p.md",
+					findings: [{ detail: "stray write", where: "packages/a/stray.ts" }],
+					feedback: "stray write",
+				},
+				null,
+				2,
+			),
+		);
+	});
+
+	it("advisory-only and a validate-report acceptance compose on one envelope (disjoint key sets)", () => {
+		const out = writeScopeVerdict(fsArtifact, [{ detail: "d", where: "w", advisory: true }], "excess", tmpDir, {
+			declaredBy: "validate-report",
+			accepted: ["packages/a/x.ts"],
+		});
+		expect(out.data).toMatchObject({
+			score: null,
+			severity: "low",
+			declaredBy: "validate-report",
+			accepted: ["packages/a/x.ts"],
+		});
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -6888,6 +8294,58 @@ describe("build edges — implement-scope-check sits between implement and valid
 		expect(r).toBe(q + 1);
 		expect(f).toBe(r + 1);
 		expect(v).toBe(f + 1);
+	});
+
+	it("build's code (elaborate) fanout is dep-gated like implement: phase ids + files-overlap deps, retryHaltedUnits kept", async () => {
+		// Elaborate lanes probe the ONE shared working tree (apply → check → revert
+		// their own write-scope). Two lanes whose `files:` overlap cannot both
+		// revert byte-identically — a lane that snapshots a co-owned file while a
+		// sibling's probe is live restores the sibling's transient blocks after the
+		// sibling reverted them (run 2026-09-12_14-29-13-5eb9). So the code fanout
+		// carries the same `id`/`deps` edges as IMPLEMENT_DAG_FANOUT.
+		const loop = findWorkflow("build").stages.code?.loop;
+		if (loop?.kind !== "fanout") throw new Error("build code stage has no fanout loop");
+		expect(loop.retryHaltedUnits).toBe(1);
+		expect(loop.concurrency).toBeUndefined();
+		const dir = mkdtempSync(join(tmpdir(), "rpiv-build-code-dag-"));
+		try {
+			const rel = ".rpiv/artifacts/plans/code-dag.md";
+			mkdirSync(join(dir, ".rpiv/artifacts/plans"), { recursive: true });
+			writeFileSync(
+				join(dir, rel),
+				[
+					"---",
+					"status: ready",
+					"phase_count: 3",
+					"phases:",
+					"  - { n: 1, title: P1, files: [packages/a/one.ts] }",
+					"  - { n: 2, title: P2, files: [packages/a/X.ts, packages/a/T.ts] }",
+					"  - { n: 3, title: P3, files: [packages/a/T.ts] }",
+					"---",
+					"# Plan",
+					"## Phase 1: P1",
+					"## Phase 2: P2",
+					"## Phase 3: P3",
+					"",
+				].join("\n"),
+			);
+			const units = await loop.units({
+				cwd: dir,
+				artifact: undefined,
+				state: {
+					named: { plans: [{ artifacts: [{ handle: fsHandle(rel) }], data: undefined, kind: "", meta: {} }] },
+				} as unknown as RunView,
+			});
+			expect(units.map((u) => [u.id, u.deps ?? []])).toEqual([
+				["phase-1", []],
+				["phase-2", []],
+				["phase-3", ["phase-2"]], // co-owns T.ts with phase 2 → serialized behind it
+			]);
+			expect(units[0]?.prompt).toBe(`${rel} Phase 1: P1`);
+			expect(units[0]?.label).toBe("phase 1/3");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("build's implement references IMPLEMENT_DAG_FANOUT, no longer carries concurrency (unpinned)", () => {
@@ -7625,5 +9083,509 @@ describe("reconcile lane stage", () => {
 				`${wf.name} has unreachable stages`,
 			).toEqual([]);
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Unit-failed routing — a dimension-bearing failed sentinel (a dead grade
+// unit, post-re-dispatch) blocks every gate fold and routes the fix arm with
+// a unit-failed note; the f9a6 incident shape (the sentinel's index overwrite
+// erasing the stale round-1 fail) is the red-today regression.
+// ---------------------------------------------------------------------------
+
+describe("grade panel unit-failed routing (dimension-bearing sentinels)", () => {
+	const build = () => findWorkflow("build");
+	const edge = (stage: string): EdgeFn => {
+		const e = build().edges[stage];
+		if (typeof e !== "function") throw new Error(`build ${stage} edge is not a function`);
+		return e as EdgeFn;
+	};
+	const chan = (rel: string, data?: Record<string, unknown>): Output =>
+		({ artifacts: [{ handle: fsHandle(rel) }], data, kind: "", meta: {} }) as unknown as Output;
+	const verdict = (dimension: string, pass: boolean, extra: Record<string, unknown> = {}): Output =>
+		({
+			artifacts: [],
+			kind: "json",
+			meta: {},
+			data: { dimension, pass, severity: pass ? "none" : "medium", ...extra },
+		}) as unknown as Output;
+	const sentinel = (dimension: string, reason = "grade produced no verdict"): Output =>
+		({ artifacts: [], kind: "failed", meta: {}, data: { reason, dimension } }) as unknown as Output;
+	const state = (named: Record<string, unknown>) => ({ named }) as unknown as RunView;
+	const route = (stage: string, named: Record<string, unknown>) =>
+		edge(stage)({ output: undefined, state: state(named) });
+
+	const PLAN = ".rpiv/artifacts/plans/p.md";
+	const PLAN_DIMS = ["actionability", "architecture-fit", "completeness", "correctness", "pattern-following"];
+	const passRest = PLAN_DIMS.filter((d) => d !== "actionability").map((d) => verdict(d, true));
+	const codeGate = (verdicts: Output[]) => ({
+		plans: [chan(PLAN)],
+		"code-cite-check": [verdict("structure", true)],
+		"code-verdicts": verdicts,
+	});
+	const planGate = (verdicts: Output[]) => ({
+		plans: [chan(PLAN)],
+		"plan-cite-check": [verdict("structure", true)],
+		"plan-verdicts": verdicts,
+	});
+
+	it("wiring: the six grade-panel loops and build's elaborate + slice-design fanouts opt into retryHaltedUnits: 1; every other fanout stays without it", () => {
+		const expected = [
+			"build:code",
+			"build:code-confirm",
+			"build:code-grade",
+			"build:plan-confirm",
+			"build:plan-grade",
+			"build:slice-design",
+			"build:slice-grade",
+			"meta:implement-grade",
+			"meta:plan-grade",
+			"meta:research-grade",
+			"ship:grade",
+		];
+		const optedIn: string[] = [];
+		for (const wf of builtInWorkflows) {
+			for (const [stage, def] of Object.entries(wf.stages)) {
+				const loop = def?.loop;
+				if (loop?.kind !== "fanout") continue;
+				if (loop.retryHaltedUnits !== undefined) optedIn.push(`${wf.name}:${stage}`);
+			}
+		}
+		expect(optedIn.sort()).toEqual(expected);
+		for (const stage of ["slice-grade", "plan-grade", "plan-confirm", "code", "code-grade", "code-confirm"]) {
+			const loop = build().stages[stage]?.loop;
+			expect(loop?.kind).toBe("fanout");
+			if (loop?.kind !== "fanout") throw new Error(`build ${stage} stage has no fanout loop`);
+			expect(loop.retryHaltedUnits).toBe(1);
+		}
+		const shipLoop = findWorkflow("ship").stages.grade?.loop;
+		expect(shipLoop?.kind).toBe("fanout");
+		if (shipLoop?.kind !== "fanout") throw new Error("ship grade stage has no fanout loop");
+		expect(shipLoop.retryHaltedUnits).toBe(1);
+	});
+
+	it("gate fold: four passing dimensions + one dimension-bearing sentinel ⇒ every gate fails; the dead dimension is named", () => {
+		const slice = state({
+			slices: [chan(".rpiv/artifacts/slices/s.md")],
+			"slice-check": [verdict("structure", true)],
+			"slice-verdicts": [sentinel("design-readiness")],
+		});
+		expect(sliceGatePasses(slice)).toBe(false);
+		expect(unitFailedDimensions(slice, "slices", "slice-verdicts", ["design-readiness"])).toEqual([
+			"design-readiness",
+		]);
+		const plan = state(planGate([...passRest, sentinel("actionability")]));
+		expect(planGatePasses(plan)).toBe(false);
+		const code = state(codeGate([...passRest, sentinel("actionability")]));
+		expect(codeGatePasses(code)).toBe(false);
+		expect(unitFailedDimensions(code, "plans", "code-verdicts", PLAN_DIMS)).toEqual(["actionability"]);
+		const ship = state({
+			plans: [chan(PLAN)],
+			"ship-verdicts": [verdict("completeness", true), verdict("correctness", true), sentinel("architecture-fit")],
+		});
+		expect(shipGatePasses(ship)).toBe(false);
+	});
+
+	it("f9a6 regression (red-today): the sentinel's index overwrite erased the stale round-1 medium fail — the gate passed on four survivors; with the dimension it blocks", () => {
+		// The exact f9a6 channel: the dead unit's sentinel sits at actionability's
+		// index, having overwritten the stale 13:49:57 medium fail.
+		const s = state(codeGate([...passRest, sentinel("actionability")]));
+		expect(unitFailedDimensions(s, "plans", "code-verdicts", PLAN_DIMS)).toEqual(["actionability"]);
+		// The route folds it: fix arm + note (on the pre-change tree the
+		// dimensionless sentinel is skipped and the gate routes onward).
+		expect(route("code-demote", codeGate([...passRest, sentinel("actionability")]))).toBe("code-snapshot");
+		expect(takeRouteNote(edge("code-demote"))).toBe("unit-failed: actionability produced no verdict");
+	});
+
+	it("red-first mirror: stale-fail-then-sentinel latest-wins at the fold; the UNFILLED-slot variant blocks WITHOUT being unit-failed", () => {
+		// Latest-wins: the sentinel follows the stale fail as the dimension's
+		// latest entry — blocking, with the dimension named for routing.
+		const staleThenSentinel = state(
+			codeGate([verdict("actionability", false), ...passRest, sentinel("actionability")]),
+		);
+		expect(codeGatePasses(staleThenSentinel)).toBe(false);
+		expect(unitFailedDimensions(staleThenSentinel, "plans", "code-verdicts", PLAN_DIMS)).toEqual(["actionability"]);
+		// The unfilled-slot mirror (infra death, no sentinel at all): the stale
+		// fail stays the dimension's latest entry and blocks — the dimension
+		// stays pending in dimensionsToRegrade — but is NOT unit-failed.
+		const staleOnly = state(codeGate([verdict("actionability", false), ...passRest]));
+		expect(codeGatePasses(staleOnly)).toBe(false);
+		expect(unitFailedDimensions(staleOnly, "plans", "code-verdicts", PLAN_DIMS)).toEqual([]);
+	});
+
+	it("plan-demote does NOT divert to confirm on a unit-failed block, even when the dimension previously passed", () => {
+		// The dead unit was actionability's re-grade; its round-1 pass makes
+		// prevBlocking === false — exactly the flap shape confirmDue diverts on.
+		// The unit-failed preemption fires FIRST: fix arm + note, no confirm
+		// session for a dimension with no verdict to adjudicate.
+		const named = planGate([verdict("actionability", true), ...passRest, sentinel("actionability")]);
+		expect(route("plan-demote", named)).toBe("plan-snapshot");
+		expect(takeRouteNote(edge("plan-demote"))).toContain("unit-failed");
+	});
+
+	it("an ordinary (non-sentinel) fail still routes through confirmDue unchanged — no note", () => {
+		expect(route("plan-demote", planGate([...passRest, verdict("actionability", false, { severity: "high" })]))).toBe(
+			"plan-confirm",
+		);
+		expect(takeRouteNote(edge("plan-demote"))).toBeUndefined();
+	});
+
+	it("slice-grade routes a dead design-readiness unit to slice-fix with the note", () => {
+		const named = {
+			slices: [chan(".rpiv/artifacts/slices/s.md")],
+			"slice-check": [verdict("structure", true)],
+			"slice-verdicts": [sentinel("design-readiness")],
+		};
+		expect(route("slice-grade", named)).toBe("slice-fix");
+		expect(takeRouteNote(edge("slice-grade"))).toBe("unit-failed: design-readiness produced no verdict");
+	});
+
+	it("ship's grade stop names unit-failed dimensions ahead of severity blockers", () => {
+		const shipEdge = findWorkflow("ship").edges.grade;
+		if (typeof shipEdge !== "function") throw new Error("ship grade edge is not an EdgeFn");
+		const s = state({
+			plans: [chan(PLAN)],
+			"ship-verdicts": [verdict("completeness", true), verdict("correctness", true), sentinel("architecture-fit")],
+		});
+		expect(shipEdge({ state: s, output: undefined })).toBe("stop");
+		expect(takeRouteNote(shipEdge)).toBe("unit-failed: architecture-fit produced no verdict");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Whole-lap progress declarations — every stage the backward-jump guard can
+// re-enter in the three quality-panel lanes carries the lane's ONE
+// panelProgress instance, so a lap reads as a single unit at every counted
+// destination. The synthetic states below replay the channel shapes each
+// re-entry point actually sees (snapshot cuts, confirm overturns, seed lifts).
+// ---------------------------------------------------------------------------
+describe("whole-lap progress declarations (panelProgress on the built-in panel lanes)", () => {
+	const PLAN = ".rpiv/artifacts/plans/p.md";
+	const iso = (h: number, m = 0): string =>
+		`2026-09-05T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00.000Z`;
+	const verdict = (dimension: string, pass: boolean, ts: string, extra: Record<string, unknown> = {}): Output =>
+		({
+			artifacts: [],
+			kind: "json",
+			meta: { ts },
+			data: { dimension, pass, severity: pass ? "none" : "high", artifact: PLAN, ...extra },
+		}) as unknown as Output;
+	const snapshotRow = (ts: string): Output =>
+		({ artifacts: [], kind: "", meta: { ts }, data: { snapshot_of: PLAN } }) as unknown as Output;
+	const planRow = (): Output =>
+		({ artifacts: [{ handle: fsHandle(PLAN) }], data: {}, kind: "", meta: {} }) as unknown as Output;
+	const view = (verdictChannel: string, snapshotChannel: string, verdicts: Output[], snapshots: Output[]): RunView =>
+		({
+			named: { plans: [planRow()], [verdictChannel]: verdicts, [snapshotChannel]: snapshots },
+		}) as unknown as RunView;
+	const round = (ts: string, blocking: string[]): Output[] =>
+		PLAN_DIMENSIONS.map((d) => verdict(d, !blocking.includes(d), ts));
+
+	it("declares the lane's ONE progress instance on all ten re-entered panel stages", () => {
+		const build = findWorkflow("build");
+		const lanes: Record<string, string[]> = {
+			slice: ["slice-grade", "slice-fix", "slice-seed-lift"],
+			plan: ["plan-grade", "plan-confirm", "plan-snapshot"],
+			code: ["code-grade", "code-confirm", "code-snapshot"],
+		};
+		const hooks: Record<string, unknown> = {
+			slice: SLICE_PANEL_PROGRESS,
+			plan: PLAN_PANEL_PROGRESS,
+			code: CODE_PANEL_PROGRESS,
+		};
+		for (const [lane, stages] of Object.entries(lanes)) {
+			for (const stage of stages) {
+				expect(build.stages[stage]?.progress, `build/${stage}`).toBe(hooks[lane]);
+			}
+		}
+		expect(findWorkflow("ship").stages.grade?.progress).toBe(SHIP_PANEL_PROGRESS);
+	});
+
+	it("an upholding lap reads the same verdict at all three of the lane's re-entry points", () => {
+		const [A, B, C, D] = PLAN_DIMENSIONS;
+		const r1 = round(iso(10), [A, B, C, D]); // 4 blocking
+		const r2 = round(iso(11), [A, B]); // broad re-grade: 2 blocking
+		const r3 = round(iso(12), [A]); // 1 blocking — the gate is still red
+		const confirmUphold = round(iso(12, 20), [A]); // confirm upholds the blocker
+		const s1 = [snapshotRow(iso(10, 30))];
+		const s2 = [snapshotRow(iso(11, 30))];
+		for (const [hook, verdictChannel, snapshotChannel] of [
+			[PLAN_PANEL_PROGRESS, "plan-verdicts", "plan-snapshot"],
+			[CODE_PANEL_PROGRESS, "code-verdicts", "code-snapshot"],
+		] as const) {
+			// Grade re-entry: rounds 1–2 behind, the last cut still the current round.
+			expect(hook(view(verdictChannel, snapshotChannel, [...r1, ...r2], [...s1, ...s2]))).toBe("improved");
+			// Confirm re-entry: round 3 graded, the fold still pre-confirm.
+			expect(hook(view(verdictChannel, snapshotChannel, [...r1, ...r2, ...r3], [...s1, ...s2]))).toBe("improved");
+			// Snapshot re-entry: the confirm upheld — the post-confirm fold reads the same.
+			expect(
+				hook(view(verdictChannel, snapshotChannel, [...r1, ...r2, ...r3, ...confirmUphold], [...s1, ...s2])),
+			).toBe("improved");
+		}
+	});
+
+	it("a confirm that overturns blockers reads improved only at the post-confirm re-entries", () => {
+		const [A, B, C] = PLAN_DIMENSIONS;
+		const r1 = round(iso(10), [A, B, C]); // 3 blocking
+		const r2 = round(iso(11), [A, B, C]); // re-graded: still 3
+		const overturn = [verdict(B, true, iso(11, 20)), verdict(C, true, iso(11, 20))];
+		const s1 = [snapshotRow(iso(10, 30))];
+		// The confirm re-entry itself reads the PRE-confirm fold: 3 blocking.
+		expect(PLAN_PANEL_PROGRESS(view("plan-verdicts", "plan-snapshot", [...r1, ...r2], s1))).toBe("unchanged");
+		// The snapshot re-entry after the overturn reads the POST-confirm fold: 1.
+		expect(PLAN_PANEL_PROGRESS(view("plan-verdicts", "plan-snapshot", [...r1, ...r2, ...overturn.flat()], s1))).toBe(
+			"improved",
+		);
+	});
+
+	it("a seed lift leaves the verdict channel unchanged — the lap stays one unit", () => {
+		const sliceVerdict = (i: number, ts: string): Output =>
+			({
+				artifacts: [],
+				kind: "json",
+				meta: { ts },
+				data: {
+					dimension: "design-readiness",
+					pass: false,
+					severity: "high",
+					artifact: `.rpiv/artifacts/slices/map-${i}.md`,
+				},
+			}) as unknown as Output;
+		// The grade re-entry that dispatched the lift saw rounds 1–2; the lift
+		// amends the map in place and publishes NO verdict, so the post-lift
+		// re-entry sees a byte-identical channel and reads the same value.
+		const beforeLift = { named: { "slice-verdicts": [sliceVerdict(1, iso(10)), sliceVerdict(2, iso(11))] } };
+		const afterLift = { named: { "slice-verdicts": [sliceVerdict(1, iso(10)), sliceVerdict(2, iso(11))] } };
+		const before = SLICE_PANEL_PROGRESS(beforeLift as unknown as RunView);
+		expect(before).toBe("unchanged");
+		expect(SLICE_PANEL_PROGRESS(afterLift as unknown as RunView)).toBe(before);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The risk-rulings panel unit — plan-authored `risks:` flags are ruled by
+// their OWN concurrent unit (split out of correctness, which finished last in
+// 80% of panels). Dispatched only when the graded plan declares `risks:`, at
+// every tier; correctness keeps its flags (--goal, --cite-check) untouched;
+// the gate, confirm divert, progress hook and dead-unit route all fold the
+// unit through the one `panelRoster` authority.
+// ---------------------------------------------------------------------------
+
+describe("risk-rulings panel unit (split out of correctness)", () => {
+	const build = () => findWorkflow("build");
+	const PLAN = ".rpiv/artifacts/plans/p.md";
+	const RISKS = [{ id: "r1", claim: "the helper returns early on undefined", claim_type: "mechanics" }];
+	const chan = (rel: string, data?: Record<string, unknown>): Output =>
+		({ artifacts: [{ handle: fsHandle(rel) }], data, kind: "", meta: {} }) as unknown as Output;
+	const verdict = (dimension: string, pass: boolean, extra: Record<string, unknown> = {}): Output =>
+		({
+			artifacts: [{ handle: fsHandle(`.rpiv/artifacts/verdicts/p__${dimension}__r1.json`) }],
+			kind: "json",
+			meta: {},
+			data: { dimension, pass, severity: pass ? "none" : "medium", artifact: PLAN, ...extra },
+		}) as unknown as Output;
+	// A GREEN citation floor on both channels: the gate predicates fold the
+	// floor's own verdict (`allDimensionsPass(state.named["plan-cite-check"])`),
+	// so the channel must carry a passing dimension verdict, not a bare handle.
+	const citeChannels = {
+		"plan-cite-check": [
+			chan(".rpiv/artifacts/verdicts/plan-cite-check__p.json", {
+				dimension: "citations",
+				pass: true,
+				severity: "none",
+			}),
+		],
+		"code-cite-check": [
+			chan(".rpiv/artifacts/verdicts/code-cite-check__p.json", {
+				dimension: "citations",
+				pass: true,
+				severity: "none",
+			}),
+		],
+	};
+	const units = async (stage: string, named: Record<string, unknown>) => {
+		const loop = build().stages[stage]?.loop;
+		if (loop?.kind !== "fanout") throw new Error(`build ${stage} stage has no fanout loop`);
+		return loop.units({ cwd: "/repo", artifact: undefined, state: { named } as unknown as RunView });
+	};
+	const edge = (stage: string, named: Record<string, unknown>) => {
+		const e = build().edges[stage];
+		if (typeof e !== "function") throw new Error(`build ${stage} edge is not a function`);
+		return (e as EdgeFn)({ output: undefined, state: { named } as unknown as RunView });
+	};
+	const FIVE = ["actionability", "architecture-fit", "completeness", "correctness", "pattern-following"];
+	const passingFive = () => FIVE.map((d) => verdict(d, true));
+
+	it("dispatches the risk-rulings unit beside the five dimensions when the plan declares risks:, with bare flags plus nothing correctness-specific", async () => {
+		const us = await units("plan-grade", {
+			plans: [chan(PLAN, { risks: RISKS })],
+			goal: [chan(".rpiv/artifacts/goal/g.md")],
+			research: [chan(".rpiv/artifacts/research/r.md")],
+			...citeChannels,
+			"plan-verdicts": [],
+		});
+		expect(us.map((u) => u.label).sort()).toEqual([...FIVE, "risk-rulings"].sort());
+		const risk = us.find((u) => u.label === "risk-rulings");
+		expect(risk?.id).toBe("plans-dim-risk-rulings");
+		expect(risk?.prompt).toBe(`--dimension risk-rulings --artifact ${PLAN}`);
+		// Correctness keeps its own inputs — the split moves duties, not flags.
+		const correctness = us.find((u) => u.label === "correctness");
+		expect(correctness?.prompt).toContain("--goal .rpiv/artifacts/goal/g.md");
+		expect(correctness?.prompt).toContain("--cite-check");
+	});
+
+	it("emits no risk unit when the plan declares no risks: (the lightening quick-plan relies on)", async () => {
+		const us = await units("plan-grade", { plans: [chan(PLAN, {})], ...citeChannels, "plan-verdicts": [] });
+		expect(us.map((u) => u.label).sort()).toEqual(FIVE);
+		expect(build().stages["plan-grade"]?.loop?.kind === "fanout").toBe(true);
+	});
+
+	it("joins the light-tier roster too — the duty follows the split out of the light roster's correctness member", async () => {
+		const us = await units("code-grade", {
+			slices: [chan(".rpiv/artifacts/slices/s.md", { slice_count: 1 })],
+			plans: [chan(PLAN, { phase_count: 1, risks: RISKS })],
+			...citeChannels,
+			"code-verdicts": [],
+		});
+		expect(us.map((u) => u.label).sort()).toEqual(["completeness", "correctness", "risk-rulings"]);
+	});
+
+	it("a failed ruling re-opens ONLY the risk unit, threading its verdict as --prior; a passing correctness carries forward", async () => {
+		const failedRisk = verdict("risk-rulings", false, { risk_rulings: [{ id: "r1", pass: false }] });
+		const us = await units("plan-grade", {
+			plans: [chan(PLAN, { risks: RISKS })],
+			...citeChannels,
+			"plan-verdicts": [...passingFive(), failedRisk],
+		});
+		expect(us.map((u) => u.label)).toEqual(["risk-rulings"]);
+		expect(us[0]?.prompt).toContain("--prior .rpiv/artifacts/verdicts/p__risk-rulings__r1.json");
+	});
+
+	it("a duty-demoted pass (mechanics ruling with no file:line evidence) re-opens the risk unit and fails the gate", async () => {
+		const demoted = verdict("risk-rulings", true, {
+			risk_rulings: [{ id: "r1", pass: true, claim_type: "mechanics" }],
+		});
+		const named = {
+			plans: [chan(PLAN, { risks: RISKS })],
+			...citeChannels,
+			"plan-verdicts": [...passingFive(), demoted],
+		};
+		expect(planGatePasses({ named } as unknown as RunView)).toBe(false);
+		expect((await units("plan-grade", named)).map((u) => u.label)).toEqual(["risk-rulings"]);
+		const grounded = verdict("risk-rulings", true, {
+			risk_rulings: [
+				{ id: "r1", pass: true, claim_type: "mechanics", evidence: "packages/x/y.ts:42 — early return" },
+			],
+		});
+		expect(
+			planGatePasses({
+				named: { ...named, "plan-verdicts": [...passingFive(), grounded] },
+			} as unknown as RunView),
+		).toBe(true);
+	});
+
+	it("the plan gate blocks on a dead risk unit (a dimension-bearing sentinel), and the demote edge routes it as unit-failed", () => {
+		const sentinel = {
+			artifacts: [],
+			kind: "failed",
+			meta: {},
+			data: { dimension: "risk-rulings" },
+		} as unknown as Output;
+		const named = {
+			plans: [chan(PLAN, { risks: RISKS })],
+			...citeChannels,
+			"plan-verdicts": [...passingFive(), sentinel],
+		};
+		expect(planGatePasses({ named } as unknown as RunView)).toBe(false);
+		expect(edge("plan-demote", named)).toBe("plan-snapshot");
+		// Without a risks: declaration the same sentinel is outside the roster —
+		// the five passing dimensions clear the gate.
+		expect(planGatePasses({ named: { ...named, plans: [chan(PLAN, {})] } } as unknown as RunView)).toBe(true);
+	});
+
+	it("a fresh failed ruling on the risk unit is confirm-worthy (routes plan-confirm), and the confirm panel re-emits only that unit", async () => {
+		const failedRisk = verdict("risk-rulings", false, { risk_rulings: [{ id: "r1", pass: false }] });
+		const named = {
+			plans: [chan(PLAN, { risks: RISKS })],
+			...citeChannels,
+			"plan-verdicts": [...passingFive(), failedRisk],
+		};
+		expect(edge("plan-demote", named)).toBe("plan-confirm");
+		const us = await units("plan-confirm", named);
+		expect(us.map((u) => u.label)).toEqual(["risk-rulings"]);
+		expect(us[0]?.prompt).toContain("--prior");
+	});
+
+	it("the whole-lap progress hook counts the risk unit as a roster member only when risks are declared", () => {
+		const snapshot = {
+			artifacts: [],
+			kind: "json",
+			meta: { ts: "2026-09-20T10:00:00.000Z" },
+			data: {},
+		} as unknown as Output;
+		const at = (o: Output, ts: string): Output => ({ ...o, meta: { ...o.meta, ts } });
+		const r1 = [...FIVE.map((d) => at(verdict(d, true), "2026-09-20T09:00:00.000Z"))];
+		// Risks declared, but the current round never graded the risk unit: the
+		// lap is incomplete — never a waiver on missing evidence.
+		expect(
+			PLAN_PANEL_PROGRESS({
+				named: {
+					plans: [chan(PLAN, { risks: RISKS })],
+					"plan-snapshot": [snapshot],
+					"plan-verdicts": [...r1, ...FIVE.map((d) => at(verdict(d, true), "2026-09-20T11:00:00.000Z"))],
+				},
+			} as unknown as RunView),
+		).toBe("unknown");
+		// No risks declared: the same trail folds over the five and improves.
+		expect(
+			PLAN_PANEL_PROGRESS({
+				named: {
+					plans: [chan(PLAN, {})],
+					"plan-snapshot": [snapshot],
+					"plan-verdicts": [
+						...FIVE.map((d) => at(verdict(d, d !== "correctness"), "2026-09-20T09:00:00.000Z")),
+						...FIVE.map((d) => at(verdict(d, true), "2026-09-20T11:00:00.000Z")),
+					],
+				},
+			} as unknown as RunView),
+		).toBe("improved");
+	});
+
+	it("ship's tier-independent panel and gate carry the risk unit the same way", async () => {
+		const named = {
+			plans: [chan(PLAN, { risks: RISKS })],
+			research: [chan(".rpiv/artifacts/research/r.md")],
+			...citeChannels,
+			"ship-verdicts": [],
+		};
+		const us = await SHIP_DIMENSION_FANOUT.units({
+			cwd: "/repo",
+			artifact: undefined,
+			state: { named } as unknown as RunView,
+		});
+		expect(us.map((u) => u.label).sort()).toEqual([...SHIP_DIMENSIONS, "risk-rulings"].sort());
+		const shipPass = SHIP_DIMENSIONS.map((d) => verdict(d, true));
+		const sentinel = {
+			artifacts: [],
+			kind: "failed",
+			meta: {},
+			data: { dimension: "risk-rulings" },
+		} as unknown as Output;
+		expect(
+			shipGatePasses({ named: { ...named, "ship-verdicts": [...shipPass, sentinel] } } as unknown as RunView),
+		).toBe(false);
+		expect(
+			shipGatePasses({
+				named: {
+					...named,
+					"ship-verdicts": [
+						...shipPass,
+						verdict("risk-rulings", true, {
+							risk_rulings: [{ id: "r1", pass: true, evidence: "packages/x/y.ts:42" }],
+						}),
+					],
+				},
+			} as unknown as RunView),
+		).toBe(true);
 	});
 });

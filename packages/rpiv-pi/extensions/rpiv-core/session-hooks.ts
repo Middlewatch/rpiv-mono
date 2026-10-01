@@ -2,7 +2,7 @@
  * Session lifecycle wiring for rpiv-core.
  *
  * Each handler body is a named helper; pi.on(...) lines are pure wiring.
- * Ordering and invariants preserved verbatim from the pre-refactor index.ts.
+ * Handler order is deliberate — preserve it.
  */
 
 import {

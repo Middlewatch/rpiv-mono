@@ -10,6 +10,7 @@
  * `/wf` usage strings live in command.ts / preview.ts.
  */
 
+import type { ProgressValue } from "./api.js";
 import { MAX_NAME_LENGTH } from "./state/index.js";
 
 /**
@@ -75,7 +76,7 @@ export const ERR_VALIDATE_RETRY_UNCHANGED = (skill: string) =>
  * a worktree unchanged since its last validation failure at the same progress
  * point (`stagesCompleted` unchanged). A `FailureText` consumed by `failedArgs`
  * (the sessionless `recordFatalFailure` descriptor, mirroring
- * `ensureBackwardJumpGuard` in `packages/rpiv-workflow/runner/chain-advance.ts`).
+ * `evaluateBackwardJumpGuard` in `packages/rpiv-workflow/runner/chain-advance.ts`).
  * The terminal skip carries the failure memo for free through the shared
  * `recordFatalFailure` writer hooks at `packages/rpiv-workflow/audit.ts:134`.
  */
@@ -118,10 +119,48 @@ export const FAIL_MISSING_NAMED_READ = (currentSkill: string, name: string, stag
 	error: `Stage ${stageNumber} (${currentSkill}) reads "${name}" but state.named["${name}"] is empty; check that an upstream produces stage publishes this name`,
 });
 
-export const FAIL_BACKWARD_JUMP_EXHAUSTED = (stage: string, revisits: number, max: number): FailureText => ({
-	toast: `rpiv: backward-jump limit exceeded — "${stage}" re-entered ${revisits} times (max ${max}) — stopping workflow to prevent infinite loop`,
-	error: `Backward-jump limit exceeded: stage "${stage}" re-entered ${revisits} times (max ${max})`,
-});
+/** Which re-entry limit tripped — the waive-aware cap or the absolute lap ceiling. */
+export type BackwardJumpLimitKind = "cap" | "ceiling";
+
+/**
+ * Everything the backward-jump halt text needs, one object — the guard
+ * defers rendering to the halt site, so a new limit arm extends the
+ * factory without another signature change.
+ */
+export interface BackwardJumpHaltInfo {
+	stage: string;
+	limitKind: BackwardJumpLimitKind;
+	/** Tripping count (the cap's re-entry count, or the ceiling's lap count). */
+	count: number;
+	max: number;
+	/** The destination's most recent progress verdicts, oldest → newest; empty ⇒ clause omitted. */
+	progress: readonly ProgressValue[];
+}
+
+/**
+ * Shared head of both limit arms. The external replay tooling greps the
+ * failure row's errMsg for exactly this case-sensitive substring
+ * (`thoughts/shared/research/replay-scripts/cap-halts.py`).
+ */
+export const BACKWARD_JUMP_LIMIT_HEAD = "Backward-jump limit exceeded";
+
+/** `; last progress: …` — only when the ring has recorded at least one verdict. */
+const backwardJumpProgressClause = (progress: readonly ProgressValue[]): string =>
+	progress.length > 0 ? `; last progress: ${progress.join(", ")}` : "";
+
+export const FAIL_BACKWARD_JUMP_EXHAUSTED = (info: BackwardJumpHaltInfo): FailureText => {
+	const clause = backwardJumpProgressClause(info.progress);
+	if (info.limitKind === "ceiling") {
+		return {
+			toast: `rpiv: backward-jump limit exceeded — "${info.stage}" re-entered ${info.count} times, over the absolute lap ceiling (max ${info.max})${clause} — stopping workflow to prevent infinite loop`,
+			error: `${BACKWARD_JUMP_LIMIT_HEAD}: stage "${info.stage}" re-entered ${info.count} times, over the absolute lap ceiling (max ${info.max})${clause}`,
+		};
+	}
+	return {
+		toast: `rpiv: backward-jump limit exceeded — "${info.stage}" re-entered ${info.count} times (max ${info.max})${clause} — stopping workflow to prevent infinite loop`,
+		error: `${BACKWARD_JUMP_LIMIT_HEAD}: stage "${info.stage}" re-entered ${info.count} times (max ${info.max})${clause}`,
+	};
+};
 
 /**
  * A decision edge terminated the chain because no branch matched — `match`
@@ -402,6 +441,34 @@ export const MSG_NAME_IGNORED_ON_RESUME =
 
 export const MSG_NAME_FLAG_MID_INPUT =
 	"/wf: --name is only honored as the first or last token — a mid-input --name is treated as workflow input text";
+
+/**
+ * A leading/trailing flag appeared more than once. The first-TYPED value
+ * wins in every slot (the parser ranks occurrences by their offset in the
+ * line, not by extraction order) and every other occurrence is stripped — never left in the
+ * input, where a leading `--max-jumps 9 research …` residual would bind the
+ * whole line as prompt text for the DEFAULT workflow.
+ */
+export const MSG_FLAG_REPEATED = (flag: string) =>
+	`/wf: ${flag} given more than once — the first value wins, the rest are ignored`;
+
+/**
+ * The waive-aware jump cap is at or above the absolute lap ceiling, so the
+ * ceiling (which counts every re-entry) always halts first and the cap can
+ * never trip — a `--max-jumps 20` alone still delivers at most `MAX_LAPS`
+ * re-entries. Surfaced at parse so the user raises `--max-laps` beside it.
+ */
+export const MSG_JUMP_CAP_ABOVE_LAP_CEILING = (cap: number, ceiling: number) =>
+	`/wf: --max-jumps ${cap} is at or above the lap ceiling ${ceiling} — the ceiling halts first, so at most ${ceiling} re-entries per stage; raise --max-laps to widen the run`;
+
+/**
+ * A programmatic budget option (`maxBackwardJumps` / `maxLaps` /
+ * `maxIterations`) that is not a non-negative integer. `??` passes `NaN`
+ * straight through, and `laps > NaN` is always false — the "always halts"
+ * ceiling would fail OPEN. Refused pre-flight, before any row is written.
+ */
+export const MSG_BUDGET_INVALID = (option: string, value: number) =>
+	`${option} must be a non-negative integer, got ${String(value)}`;
 
 export const MSG_LOAD_ABORTED = (count: number) =>
 	`/wf: ${count} ${count === 1 ? "config error" : "config errors"} — see warnings above (fix and re-run)`;

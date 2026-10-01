@@ -88,8 +88,7 @@ export interface PendingInput {
 export const SINGLE_UNIT_KEY = -1;
 
 /**
- * One fan-out unit's switchable sub-lane. Bundles everything that used to
- * live as a single scalar on `LaneEntry` — the live child session, the terminal
+ * One fan-out unit's switchable sub-lane. Bundles the live child session, the terminal
  * snapshot (branch/cwd/tool-defs), the durable disk-fallback pointer, and the
  * deferred-input queue — so each concurrent unit owns its own slot keyed by its
  * declared fan-out `index`. Under fan-out a sibling's teardown can never clobber

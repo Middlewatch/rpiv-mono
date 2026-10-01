@@ -16,8 +16,9 @@ Slash-command-only Pi extension. Spawns a one-off side call to the same primary 
 
 ## Module Structure
 ```
-.                — Flat package. Logic + state in one source module; overlay controller in another;
-                   host-version-tolerant `completeSimple` loader in `pi-compat.ts` (shipped via `files`);
+.                — Flat package. Logic + state in one source module (btw.ts); overlay controller in another (btw-ui.ts);
+                   the BtwTurn record + text extractors in a cycle-break leaf (btw-messages.ts); context budgeting in
+                   btw-budget.ts; host-version-tolerant `completeSimple` loader in `pi-compat.ts` (shipped via `files`);
                    composer (index.ts) wires command registrar + lifecycle hooks.
 prompts/         — System-prompt asset shipped via `files`. Loaded once at module init.
 ```

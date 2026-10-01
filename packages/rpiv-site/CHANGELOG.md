@@ -9,6 +9,23 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- "v2.12: a challenger for build" blog post: release notes for v2.12.0, covering the meta unit-graph workflow and its A/B harness, the lens-grade skill, the typebox host-provided peer fix, the meta WIP guard, and the grade skill's comment-only rule.
+
+## [2.12.0] - 2026-09-30
+
+### Added
+
+- "One day of the loop" blog post: a case study of a single `/wf build` run on a reverse-engineered earbuds app — one sentence in at 09:22, a third device family committed at 20:24 (113 files, 16,042 insertions, all on GLM-5.3), what the gates did at every stage, and why the pipeline rather than the model carried the quality.
+- "v2.11: the judge was the wall clock" blog post: release notes for v2.11.0, covering the risk-rulings panel unit, the batched commit-first correctness judge with its replay, and the acceptance disposition contract for build's planner.
+
+## [2.11.0] - 2026-09-21
+
+## [2.10.1] - 2026-09-13
+
+## [2.10.0] - 2026-09-12
+
+### Added
+
 - "v2.1 to v2.9: teaching the pipeline to finish" blog post: version-by-version release notes for the arc since v2.0, framed around the six lines every change follows, each item with its rationale.
 
 ## [2.9.0] - 2026-09-01

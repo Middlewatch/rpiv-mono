@@ -259,6 +259,15 @@ const verifyCitations = (body: string, cwd: string, declared?: ReadonlySet<strin
 		const [, path, startStr, endStr] = m;
 		if (!path || !startStr) continue;
 		if (fenced.some(([s, e]) => m.index >= s && m.index < e)) continue;
+		// Sanctioned quoting — arrow-pair halves: a citation immediately followed
+		// by "→" (a revision note's OLD half) or immediately preceded by "→" (its
+		// NEW half) is a quoted reference, not a live claim — the same contract
+		// `citeOccursLive` honors for the cite remedy (the slice skill's re-slice
+		// mode pins revision-note quotations to arrow pairs or fences). Skipped
+		// BEFORE the `seen`-key bookkeeping so a live occurrence of the same cite
+		// elsewhere in the body still verifies.
+		if (body.startsWith("→", m.index + m[0].length)) continue;
+		if (body.endsWith("→", m.index)) continue;
 		if (PLACEHOLDER_CITATION_PREFIXES.some((p) => path.startsWith(p))) continue;
 		const key = `${path}:${startStr}${endStr ? `-${endStr}` : ""}`;
 		if (seen.has(key)) continue;

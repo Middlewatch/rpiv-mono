@@ -14,7 +14,7 @@ Orchestration shell above leaf widgets: composes pi-tui primitives into a height
 stateful-view.ts          — StatefulView<P> interface + ActiveView discriminant
 component-binding.ts      — globalBinding / perTabBinding factories → BoundGlobalBinding / BoundPerTabBinding
 props-adapter.ts          — QuestionnairePropsAdapter (fan-out + invalidate())
-tab-components.ts         — TabComponents per-tab bundle record
+tab-components.ts         — TabComponents per-tab bundle record (incl. the `bodyHeights(width) → {current, max}` thunk feeding the dialog's height closures)
 tab-content-strategy.ts   — TabContentStrategy + QuestionTabStrategy / SubmitTabStrategy + OneLineClippedText
 dialog-builder.ts         — DialogView class + hint/heading constants + DialogProps/DialogConfig.
                             Residual height-equalizer computed inline as `spacerRows` in `render()`.
@@ -67,7 +67,9 @@ class QuestionTabStrategy implements TabContentStrategy {
     // hint via OneLineClippedText (not Text): the collapse affordance would word-wrap and break footerRowCount=2
     footerRows(state) { return [Spacer, OneLineClippedText(hint)]; }
 }
-// SubmitTabStrategy: footerRowCount = 5; pads missing picker with Spacer rows to preserve count
+// SubmitTabStrategy: footerRowCount = 5; pads missing picker with Spacer rows to preserve count; mounts the
+// shared notes Editor in midRows for the global note (GLOBAL_NOTES_HEADER) + a committed-note review entry
+// gated on !state.notesVisible; the submit hint row adds the global-note key while the editor is closed
 ```
 
 ## DialogView Chrome Order (always)
